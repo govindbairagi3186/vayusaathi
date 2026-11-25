@@ -1,23 +1,23 @@
 """
-HawaWise AI - Main FastAPI Application Server
+VayuSaathi - Main FastAPI Application Server
 Provides RESTful APIs for Air Quality, GenAI Assistant, Household Profiles,
 Smart Routines, Indoor Air Intelligence, Sustainable Alternatives,
-Community Hub, Impact Tracking, Alerts, and Judges' Demonstration Mode.
-Serves frontend SPA and video demonstration assets.
+Community Hub, Impact Tracking, Alerts, and Demonstration Scenarios.
+Serves frontend SPA static assets cleanly.
 """
 
 import os
 import json
 from datetime import datetime
-from typing import Dict, Any, List, Optional
-from fastapi import FastAPI, HTTPException, Query, Body
+from typing import Dict, Any, List, Optional, Literal
+from fastapi import FastAPI, HTTPException, Query, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
 
 from backend.database import (
-    init_db, get_connection, get_profile, update_profile,
+    init_db, db_session, get_connection, get_profile, update_profile,
     get_setting, set_setting
 )
 from backend.air_quality_service import fetch_air_quality, CITIES
@@ -34,72 +34,89 @@ init_db()
 
 app = FastAPI(
     title="VayuSaathi API",
-    description="Your GenAI Companion for Winter Smog & Urban Air Pollution",
-    version="1.0.0"
+    description="Urban Air Quality, Google Maps Spatial Monitoring & Personal Exposure Protection Companion",
+    version="2.0.0"
 )
 
-# Enable CORS for development and cross-origin access
+# Permissive CORS for standalone local HTML/Live Server usage without exposing credentials
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Accept"],
 )
 
-# Pydantic Request Models
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    """Attach standard baseline HTTP security headers to all API and static responses."""
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "SAMEORIGIN"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    return response
+
+
+# Validated Pydantic Request Models
 class ChatRequest(BaseModel):
-    messages: List[Dict[str, str]]
-    city: Optional[str] = "Delhi NCR"
-    aqi: Optional[int] = 350
-    category: Optional[str] = "Very Poor"
-    pm2_5: Optional[float] = 180.0
+    messages: List[Dict[str, str]] = Field(default_factory=list, max_length=40)
+    city: Optional[str] = Field(default="Delhi NCR", max_length=120)
+    aqi: Optional[int] = Field(default=350, ge=0, le=1000)
+    category: Optional[str] = Field(default="Very Poor", max_length=40)
+    pm2_5: Optional[float] = Field(default=180.0, ge=0.0, le=2000.0)
     temperature_inversion: Optional[bool] = True
+    ai_persona: Optional[Literal["scientist", "commuter", "pediatric"]] = "scientist"
     location_briefing: Optional[Dict[str, Any]] = None
 
+
 class RoutineRequest(BaseModel):
-    city: Optional[str] = "Delhi NCR"
-    aqi: Optional[int] = 350
-    category: Optional[str] = "Very Poor"
-    pm2_5: Optional[float] = 180.0
+    city: Optional[str] = Field(default="Delhi NCR", max_length=120)
+    aqi: Optional[int] = Field(default=350, ge=0, le=1000)
+    category: Optional[str] = Field(default="Very Poor", max_length=40)
+    pm2_5: Optional[float] = Field(default=180.0, ge=0.0, le=2000.0)
+
 
 class ProfileRequest(BaseModel):
-    household_size: int = 4
-    children_count: int = 1
-    seniors_count: int = 1
-    has_asthma_respiratory: int = 0
-    commute_mode: str = "two_wheeler"
-    daily_commute_km: float = 15.0
-    home_ventilation: str = "split_ac_windows"
-    has_air_purifier: int = 0
-    school_office_hours: str = "8:30 AM - 5:30 PM"
-    indoor_outdoor_pref: str = "mostly_indoor_smog_season"
-    city: str = "Delhi NCR"
+    household_size: int = Field(default=4, ge=1, le=20)
+    children_count: int = Field(default=1, ge=0, le=15)
+    seniors_count: int = Field(default=1, ge=0, le=15)
+    has_asthma_respiratory: int = Field(default=0, ge=0, le=1)
+    commute_mode: str = Field(default="two_wheeler", max_length=50)
+    daily_commute_km: float = Field(default=15.0, ge=0.0, le=250.0)
+    home_ventilation: str = Field(default="split_ac_windows", max_length=60)
+    has_air_purifier: int = Field(default=0, ge=0, le=1)
+    school_office_hours: str = Field(default="8:30 AM - 5:30 PM", max_length=60)
+    indoor_outdoor_pref: str = Field(default="mostly_indoor_smog_season", max_length=60)
+    city: str = Field(default="Delhi NCR", max_length=120)
+
 
 class ActionLogRequest(BaseModel):
-    action_type: str
-    category: str
-    title: str
-    description: Optional[str] = ""
-    co2_saved_kg: float = 0.5
-    pm_saved_g: float = 0.15
-    points: int = 15
+    action_type: str = Field(..., min_length=1, max_length=60)
+    category: str = Field(..., min_length=1, max_length=40)
+    title: str = Field(..., min_length=1, max_length=140)
+    description: Optional[str] = Field(default="", max_length=400)
+    co2_saved_kg: float = Field(default=0.5, ge=0.0, le=500.0)
+    pm_saved_g: float = Field(default=0.15, ge=0.0, le=5000.0)
+    points: int = Field(default=15, ge=1, le=500)
+
 
 class CommunityReportRequest(BaseModel):
-    title: str
-    category: str
-    description: str
-    location_name: str
-    severity: str = "medium"
+    title: str = Field(..., min_length=2, max_length=140)
+    category: str = Field(..., min_length=2, max_length=50)
+    description: str = Field(..., min_length=4, max_length=600)
+    location_name: str = Field(..., min_length=2, max_length=120)
+    severity: Literal["low", "medium", "high", "critical"] = "medium"
+
 
 class SettingsRequest(BaseModel):
-    gemini_api_key: Optional[str] = None
-    google_maps_api_key: Optional[str] = None
-    theme: Optional[str] = "dark"
+    gemini_api_key: Optional[str] = Field(default=None, max_length=256)
+    google_maps_api_key: Optional[str] = Field(default=None, max_length=256)
+    theme: Optional[Literal["dark", "light"]] = "dark"
     demo_mode: Optional[bool] = False
-    map_layer: Optional[str] = "google_streets"
+    map_layer: Optional[str] = Field(default="google_streets", max_length=40)
     auto_locate: Optional[bool] = True
-    temp_unit: Optional[str] = "C"
+    temp_unit: Optional[Literal["C", "F"]] = "C"
 
 # API Routes
 
@@ -159,34 +176,33 @@ async def chat_assistant(req: ChatRequest):
         "category": req.category,
         "pm2_5": req.pm2_5,
         "temperature_inversion": req.temperature_inversion,
+        "ai_persona": req.ai_persona,
         "location_briefing": req.location_briefing,
         "profile": profile
     }
-    
-    # Store user query in db
+
     if req.messages:
         last_user = req.messages[-1]
         if last_user.get("role") == "user":
-            conn = get_connection()
-            cursor = conn.cursor()
-            cursor.execute("""
-            INSERT INTO chat_messages (role, content, metadata_json, created_at)
-            VALUES (?, ?, ?, ?)
-            """, ("user", last_user.get("content", ""), json.dumps({"city": req.city, "aqi": req.aqi}), datetime.now().isoformat()))
-            conn.commit()
-            conn.close()
+            with db_session() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO chat_messages (role, content, metadata_json, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    ("user", last_user.get("content", "")[:2000], json.dumps({"city": req.city, "aqi": req.aqi}), datetime.now().isoformat())
+                )
 
     ai_response = await generate_chat_response(req.messages, context)
 
-    # Store assistant response in db
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-    INSERT INTO chat_messages (role, content, metadata_json, created_at)
-    VALUES (?, ?, ?, ?)
-    """, ("assistant", ai_response.get("reply", ""), json.dumps(ai_response), datetime.now().isoformat()))
-    conn.commit()
-    conn.close()
+    with db_session() as conn:
+        conn.execute(
+            """
+            INSERT INTO chat_messages (role, content, metadata_json, created_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            ("assistant", ai_response.get("reply", ""), json.dumps(ai_response), datetime.now().isoformat())
+        )
 
     return ai_response
 
@@ -623,11 +639,6 @@ async def get_demo_scenario(scenario_name: str):
     }
     return scenarios.get(scenario_name, scenarios["delhi_winter"])
 
-# Mount Video Submission directory for streaming
-video_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "video-submission")
-if os.path.exists(video_dir):
-    app.mount("/video-assets", StaticFiles(directory=video_dir), name="video_assets")
-
 # Mount Frontend Static Assets
 frontend_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "frontend")
 if os.path.exists(frontend_dir):
@@ -639,19 +650,10 @@ if os.path.exists(frontend_dir):
         app.mount("/js", StaticFiles(directory=js_dir), name="frontend_js")
     app.mount("/static", StaticFiles(directory=frontend_dir), name="frontend_static")
 
+
 @app.api_route("/", methods=["GET", "HEAD"])
 async def serve_index():
     index_file = os.path.join(frontend_dir, "index.html")
     if os.path.exists(index_file):
         return FileResponse(index_file)
-    return {"message": "HawaWise AI API is running. Frontend index.html not found."}
-
-@app.api_route("/video", methods=["GET", "HEAD"])
-async def serve_video():
-    mp4_file = os.path.join(video_dir, "HawaWise_AI_Demo.mp4")
-    if os.path.exists(mp4_file):
-        return FileResponse(mp4_file, media_type="video/mp4")
-    return JSONResponse(
-        status_code=404,
-        content={"message": "Video demo rendering in progress. Check /video-submission directory."}
-    )
+    return {"message": "VayuSaathi API is running. Frontend index.html not found."}

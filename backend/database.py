@@ -1,23 +1,43 @@
 """
-HawaWise AI - Database Module
+VayuSaathi - Database Module
 SQLite persistence for household profiles, saved routines, completed actions,
 chat history, community reports, alerts, and application settings.
 """
 
 import sqlite3
-import json
 import os
+from contextlib import contextmanager
 from datetime import datetime
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, Optional
 
-DB_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "hawawise.db")
+DB_FILE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "data",
+    "vayusaathi.db",
+)
 
-def get_connection():
+
+def get_connection() -> sqlite3.Connection:
+    """Open a SQLite connection configured with row dict access and lock timeout."""
     os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
     conn = sqlite3.connect(DB_FILE, timeout=10.0)
     conn.execute("PRAGMA busy_timeout=5000;")
     conn.row_factory = sqlite3.Row
     return conn
+
+
+@contextmanager
+def db_session():
+    """Yield a managed SQLite connection that commits on success and always closes."""
+    conn = get_connection()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 def init_db():
     conn = get_connection()

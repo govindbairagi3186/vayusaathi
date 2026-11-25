@@ -1,5 +1,5 @@
 """
-HawaWise AI - Environmental Impact Calculator & Comparison Engine
+VayuSaathi - Environmental Impact Calculator & Comparison Engine
 Calculates avoided CO2 (kg) and avoided PM2.5 (g) using verified emission factors
 from Indian Central Electricity Authority (CEA), Petroleum Conservation Research
 Association (PCRA), Central Pollution Control Board (CPCB), and IPCC.

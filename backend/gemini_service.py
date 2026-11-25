@@ -1,5 +1,5 @@
 """
-HawaWise AI - Generative AI Service
+VayuSaathi - Generative AI Service
 Interfaces with Google Gemini API via official google-genai SDK.
 Provides context-aware conversational assistant, daily routine generator,
 family protection action planner, and impact explanation engine.
@@ -136,7 +136,7 @@ Air Purifier in Home: {"Yes" if profile.get('has_air_purifier') else "No"}
         "ai_provider": "offline_structured_expert_engine",
         "model_name": "cpcb-who-environmental-expert-v1",
         "is_live_ai": False,
-        "note": "Generated via HawaWise Environmental Intelligence Engine. Configure GEMINI_API_KEY in Settings or .env for live Gemini 2.5 Flash cloud generation.",
+        "note": "Generated via VayuSaathi Environmental Intelligence Engine. Configure GEMINI_API_KEY in Settings or .env for live Gemini 2.5 Flash cloud generation.",
         "context_used": {
             "city": city,
             "aqi": current_aqi,

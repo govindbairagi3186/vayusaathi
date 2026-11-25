@@ -1,9 +1,9 @@
 """
-HawaWise AI - Air Quality Service
+VayuSaathi - Air Quality Service
 Fetches live environmental metrics from Open-Meteo Air Quality & Weather APIs.
 Calculates Indian National Air Quality Index (NAQI) per CPCB standards.
 Provides verified historical winter smog baseline data when live network is unavailable.
-Resolves GPS coordinates to localities and transparently distinguishes live vs demo/cached data.
+Resolves GPS coordinates to localities and transparently distinguishes live vs cached data.
 """
 
 import httpx

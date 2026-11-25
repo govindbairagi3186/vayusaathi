@@ -1,10 +1,76 @@
 /**
  * VayuSaathi - Master Frontend Application
  * Minimalist, human-designed UI with high-precision geolocation,
- * spatial monitoring network, multi-layer Leaflet map, and live CPCB NAQI analysis.
+ * Google Maps spatial monitoring network, multi-layer views, and live CPCB NAQI analysis.
  */
 
 const api = window.api || (typeof self !== 'undefined' ? self.api : null);
+
+// Security & Resilience Helpers
+function escapeHtml(val) {
+  if (val === null || val === undefined) return '';
+  return String(val)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function safeHexColor(val, fallback = '#10b981') {
+  return typeof val === 'string' && /^#[0-9a-fA-F]{3,8}$/.test(val.trim()) ? val.trim() : fallback;
+}
+
+function safeDateLabel(raw, withTime = false) {
+  if (!raw) return 'Recently';
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return escapeHtml(String(raw));
+  return withTime ? d.toLocaleString() : d.toLocaleDateString();
+}
+
+function debounce(fn, delayMs = 120) {
+  let timerId = null;
+  return function (...args) {
+    if (timerId) clearTimeout(timerId);
+    timerId = setTimeout(() => {
+      timerId = null;
+      fn.apply(this, args);
+    }, delayMs);
+  };
+}
+
+function showToast(message, type = 'info') {
+  const container = document.getElementById('toast-container');
+  if (!container) return;
+
+  const palette = {
+    success: 'bg-emerald-950/95 border-emerald-500/40 text-emerald-200',
+    error: 'bg-rose-950/95 border-rose-500/40 text-rose-200',
+    warning: 'bg-amber-950/95 border-amber-500/40 text-amber-200',
+    info: 'bg-slate-900/95 border-slate-600 text-slate-200'
+  };
+
+  const toast = document.createElement('div');
+  toast.className = `vayusaathi-toast px-3.5 py-2.5 rounded-lg border text-xs shadow-xl backdrop-blur-md flex items-center justify-between gap-3 ${palette[type] || palette.info}`;
+  toast.setAttribute('role', 'status');
+
+  const span = document.createElement('span');
+  span.textContent = String(message || '');
+  toast.appendChild(span);
+
+  const closeBtn = document.createElement('button');
+  closeBtn.type = 'button';
+  closeBtn.setAttribute('aria-label', 'Dismiss notification');
+  closeBtn.className = 'text-slate-400 hover:text-white shrink-0 font-semibold';
+  closeBtn.textContent = '×';
+  closeBtn.addEventListener('click', () => toast.remove());
+  toast.appendChild(closeBtn);
+
+  container.appendChild(toast);
+  setTimeout(() => {
+    if (toast.parentNode) toast.remove();
+  }, 4000);
+}
 
 // Vector Icon System (Lucide / Feather-inspired SVG strokes)
 const icons = {
@@ -161,12 +227,17 @@ const state = {
   isTracking: false,
   watchId: null,
   nearestStation: null,
-  mapLayer: localStorage.getItem('vayusaathi_map_layer') || 'google_streets', // 'google_streets' | 'google_satellite' | 'google_hybrid' | 'google_terrain' | 'google_traffic' | 'dark' | 'osm'
+  mapLayer: localStorage.getItem('vayusaathi_map_layer') || 'google_streets',
   googleMapsKey: localStorage.getItem('vayusaathi_google_maps_key') || '',
   autoLocate: localStorage.getItem('vayusaathi_auto_locate') !== 'false',
-  mapZoomLevel: parseInt(localStorage.getItem('vayusaathi_map_zoom') || '11'),
+  mapZoomLevel: parseInt(localStorage.getItem('vayusaathi_map_zoom') || '11', 10) || 11,
   highContrast: localStorage.getItem('vayusaathi_high_contrast') === 'true',
-  refreshInterval: parseInt(localStorage.getItem('vayusaathi_refresh_interval') || '5'),
+  refreshInterval: (() => {
+    const raw = localStorage.getItem('vayusaathi_refresh_interval');
+    const parsed = raw !== null ? parseInt(raw, 10) : 5;
+    return Number.isFinite(parsed) ? parsed : 5;
+  })(),
+  refreshTimerId: null,
   aiPersona: localStorage.getItem('vayusaathi_ai_persona') || 'scientist',
   isMapFullscreen: false,
   mapFilter: 'all', // 'all' | 'severe' | 'very_poor' | 'poor_mod' | 'good'
@@ -176,6 +247,7 @@ const state = {
   cities: [],
   airQuality: null,
   profile: null,
+  familyPlan: null,
   chatMessages: [],
   alerts: [],
   impactStats: null,
@@ -192,18 +264,34 @@ const state = {
 // Application Initialization
 document.addEventListener('DOMContentLoaded', async () => {
   applyTheme(state.theme);
+  applyHighContrast(state.highContrast);
   setupNavigation();
   setupGlobalModals();
   await loadInitialData();
+  syncRefreshTimer();
   checkAutoLocation();
   renderCurrentView();
 });
 
-// Theme Management
+// Clean up active GPS watchers and timers before leaving page
+window.addEventListener('beforeunload', () => {
+  if (state.watchId !== null && navigator.geolocation) {
+    navigator.geolocation.clearWatch(state.watchId);
+    state.watchId = null;
+  }
+  if (state.refreshTimerId !== null) {
+    clearInterval(state.refreshTimerId);
+    state.refreshTimerId = null;
+  }
+  cleanupActiveViewResources();
+});
+
+// Theme & Accessibility Management
 function applyTheme(theme) {
   state.theme = theme;
-  localStorage.setItem('vayusaathi_theme', theme);
-  localStorage.setItem('hawawise_theme', theme);
+  try {
+    localStorage.setItem('vayusaathi_theme', theme);
+  } catch (e) {}
   const sunIcons = document.querySelectorAll('.theme-sun-icon');
   const moonIcons = document.querySelectorAll('.theme-moon-icon');
 
@@ -218,11 +306,63 @@ function applyTheme(theme) {
   }
 }
 
+function applyHighContrast(enabled) {
+  state.highContrast = Boolean(enabled);
+  document.documentElement.classList.toggle('high-contrast-aqi', state.highContrast);
+}
+
+// Release offscreen Chart.js canvases and Leaflet map instances to prevent memory leaks
+function cleanupActiveViewResources() {
+  Object.keys(state.charts).forEach((key) => {
+    const ch = state.charts[key];
+    if (ch && typeof ch.destroy === 'function') {
+      try { ch.destroy(); } catch (e) {}
+    }
+    delete state.charts[key];
+  });
+
+  if (window.leafletMapInstance && state.currentView !== 'map') {
+    try {
+      window.leafletMapInstance.remove();
+    } catch (e) {}
+    window.leafletMapInstance = null;
+    window.tileLayerInstance = null;
+    window.stationMarkersMap = null;
+    window.userMarkerGroup = null;
+    window.inspectedMarker = null;
+  }
+}
+
+// Single Managed Auto-Refresh Timer (matches Settings cadence)
+function syncRefreshTimer() {
+  if (state.refreshTimerId !== null) {
+    clearInterval(state.refreshTimerId);
+    state.refreshTimerId = null;
+  }
+  if (!state.refreshInterval || state.refreshInterval <= 0 || !api) return;
+
+  const intervalMs = state.refreshInterval * 60 * 1000;
+  state.refreshTimerId = setInterval(async () => {
+    if (document.hidden) return;
+    try {
+      const lat = state.userCoords?.lat ?? null;
+      const lon = state.userCoords?.lon ?? null;
+      state.airQuality = await api.getAirQuality(state.currentCity, lat, lon);
+      updateTopHeaderMetrics();
+      if (state.currentView === 'dashboard') {
+        renderCurrentView();
+      }
+    } catch (e) {
+      // Non-fatal silent refresh failure
+    }
+  }, intervalMs);
+}
+
 // Temperature Formatter
 function formatTemp(celsius) {
-  if (celsius === undefined || celsius === null) return '--';
+  if (celsius === undefined || celsius === null || Number.isNaN(Number(celsius))) return '--';
   if (state.tempUnit === 'F') {
-    return `${Math.round((celsius * 9 / 5) + 32)}°F`;
+    return `${Math.round((Number(celsius) * 9 / 5) + 32)}°F`;
   }
   return `${celsius}°C`;
 }
@@ -264,23 +404,40 @@ function setupNavigation() {
   const sidebar = document.getElementById('sidebar');
   if (mobileToggle && sidebar) {
     mobileToggle.addEventListener('click', () => {
+      const willOpen = sidebar.classList.contains('hidden');
       sidebar.classList.toggle('hidden');
+      mobileToggle.setAttribute('aria-expanded', String(willOpen));
     });
   }
   if (mobileClose && sidebar) {
     mobileClose.addEventListener('click', () => {
       sidebar.classList.add('hidden');
+      if (mobileToggle) mobileToggle.setAttribute('aria-expanded', 'false');
     });
   }
 }
 
 function navigateTo(viewName) {
+  if (state.isMapFullscreen) {
+    window.toggleMapFullscreen();
+  }
   state.currentView = viewName;
+  cleanupActiveViewResources();
+
+  const sidebar = document.getElementById('sidebar');
+  const mobileToggle = document.getElementById('mobile-menu-btn');
+  if (sidebar && window.innerWidth < 768) {
+    sidebar.classList.add('hidden');
+    if (mobileToggle) mobileToggle.setAttribute('aria-expanded', 'false');
+  }
+
   document.querySelectorAll('[data-view]').forEach(l => {
     if (l.getAttribute('data-view') === viewName) {
       l.classList.add('nav-tab-active');
+      l.setAttribute('aria-current', 'page');
     } else {
       l.classList.remove('nav-tab-active');
+      l.removeAttribute('aria-current');
     }
   });
   renderCurrentView();
@@ -290,12 +447,13 @@ function navigateTo(viewName) {
 // Initial Data Fetch
 async function loadInitialData() {
   try {
-    const [cityData, aqData, profileData, alertData, impactData] = await Promise.all([
+    const [cityData, aqData, profileData, alertData, impactData, chatHist] = await Promise.all([
       api ? api.getCities() : null,
       api ? api.getAirQuality(state.currentCity) : null,
       api ? api.getProfile() : null,
       api ? api.getAlerts() : null,
-      api ? api.getImpactStats() : null
+      api ? api.getImpactStats() : null,
+      api ? api.getChatHistory() : null
     ]);
 
     state.cities = cityData?.cities || [];
@@ -303,6 +461,9 @@ async function loadInitialData() {
     state.profile = profileData || {};
     state.alerts = alertData?.alerts || [];
     state.impactStats = impactData || {};
+    if (chatHist?.messages?.length) {
+      state.chatMessages = chatHist.messages;
+    }
   } catch (err) {
     console.error("Failed to load initial data:", err);
   }
@@ -351,7 +512,7 @@ async function checkAutoLocation() {
 async function detectUserLocation(silent = false, centerMap = false) {
   if (state.isLocating) return;
   if (!navigator.geolocation) {
-    if (!silent) alert("Geolocation is not supported by your browser. Please select a station manually.");
+    if (!silent) showToast("Geolocation is not supported by your browser. Please select a station manually.", "warning");
     return;
   }
 
@@ -416,7 +577,7 @@ async function detectUserLocation(silent = false, centerMap = false) {
           ? `The device only reported location within ±${Math.round(err.accuracy / 1000)} km, which is too imprecise for local AQI. Enable device location services and try again outdoors.`
           : "A sufficiently accurate GPS fix was not available. Enable device location services, allow browser location access, and try again outdoors.";
       }
-      alert(msg);
+      showToast(msg, "warning");
     }
   } finally {
     state.isLocating = false;
@@ -483,7 +644,7 @@ function getHighAccuracyPosition() {
 // Continuous Live Location Tracking (watchPosition)
 function toggleLiveTracking() {
   if (!navigator.geolocation) {
-    alert("Geolocation is not supported by your browser.");
+    showToast("Geolocation is not supported by your browser.", "warning");
     return;
   }
 
@@ -491,11 +652,13 @@ function toggleLiveTracking() {
     navigator.geolocation.clearWatch(state.watchId);
     state.watchId = null;
     state.isTracking = false;
+    showToast("Live GPS tracking stopped.", "info");
     renderCurrentView();
     return;
   }
 
   state.isTracking = true;
+  showToast("Live GPS tracking enabled.", "success");
   state.watchId = navigator.geolocation.watchPosition(
     async (pos) => {
       const { latitude, longitude, accuracy } = pos.coords;
@@ -549,6 +712,7 @@ function toggleLiveTracking() {
       state.isTracking = false;
       if (state.watchId) navigator.geolocation.clearWatch(state.watchId);
       state.watchId = null;
+      showToast("Live GPS watch interrupted.", "warning");
     },
     { enableHighAccuracy: true, timeout: 20000, maximumAge: 0 }
   );
@@ -560,14 +724,12 @@ function updateMapUserPosition(lat, lon, accuracy, localityName, nearest) {
   const map = window.leafletMapInstance;
   if (!map) return;
 
-  // Remove existing user layer if present
   if (window.userMarkerGroup) {
     map.removeLayer(window.userMarkerGroup);
   }
   window.userMarkerGroup = L.layerGroup().addTo(map);
 
-  // Precision circle buffer
-  const circle = L.circle([lat, lon], {
+  L.circle([lat, lon], {
     radius: Math.max(accuracy, 20),
     color: '#0284c7',
     fillColor: '#0284c7',
@@ -576,7 +738,6 @@ function updateMapUserPosition(lat, lon, accuracy, localityName, nearest) {
     dashArray: '4, 4'
   }).addTo(window.userMarkerGroup);
 
-  // Inner dot
   const marker = L.circleMarker([lat, lon], {
     radius: 7,
     fillColor: '#0284c7',
@@ -586,7 +747,13 @@ function updateMapUserPosition(lat, lon, accuracy, localityName, nearest) {
     fillOpacity: 1
   }).addTo(window.userMarkerGroup);
 
-  const locTitle = localityName || 'Your Location';
+  const locTitle = escapeHtml(localityName || 'Your Location');
+  const nearestHtml = nearest ? `
+    <div class="text-[11px] text-emerald-400 mt-1 pt-1 border-t border-slate-800">
+      Nearest: <strong>${escapeHtml(nearest.station.name)}</strong> (${nearest.distanceKm} km)
+    </div>
+  ` : '';
+
   marker.bindPopup(`
     <div class="p-1">
       <div class="font-semibold text-xs text-slate-100 flex items-center gap-1.5">
@@ -595,11 +762,7 @@ function updateMapUserPosition(lat, lon, accuracy, localityName, nearest) {
       </div>
       <div class="text-[11px] text-slate-400 mt-1">${lat.toFixed(4)}°N, ${lon.toFixed(4)}°E</div>
       <div class="text-[11px] text-slate-300 mt-0.5">Accuracy: <strong>±${Math.round(accuracy)}m</strong></div>
-      ${nearest ? `
-        <div class="text-[11px] text-emerald-400 mt-1 pt-1 border-t border-slate-800">
-          Nearest: <strong>${nearest.station.name}</strong> (${nearest.distanceKm} km)
-        </div>
-      ` : ''}
+      ${nearestHtml}
     </div>
   `).openPopup();
 
@@ -683,12 +846,13 @@ function updateTopHeaderMetrics() {
 
   const aqiBadge = document.getElementById('header-aqi-pill');
   if (aqiBadge) {
-    const locName = state.userCoords?.locality || aq.city.split(',')[0];
+    const locName = escapeHtml(state.userCoords?.locality || String(aq.city || 'Delhi').split(',')[0]);
+    const color = safeHexColor(aq.color);
     aqiBadge.innerHTML = `
-      <span class="inline-block w-2 h-2 rounded-full mr-2" style="background-color: ${aq.color}"></span>
+      <span class="inline-block w-2 h-2 rounded-full mr-2 shrink-0" style="background-color: ${color}"></span>
       <span class="font-medium text-slate-200">${locName}:</span>
-      <span class="ml-1 text-slate-300">AQI ${aq.aqi}</span>
-      <span class="ml-1.5 text-[11px] text-slate-400">(${aq.category})</span>
+      <span class="ml-1 text-slate-300">AQI ${escapeHtml(aq.aqi)}</span>
+      <span class="ml-1.5 text-[11px] text-slate-400">(${escapeHtml(aq.category)})</span>
     `;
   }
 
@@ -816,11 +980,19 @@ function renderDashboard(container) {
   }
 
   const cityOptions = state.cities.map(c => `
-    <option value="${c.key}" ${c.key === state.currentCity ? 'selected' : ''}>${c.name} (AQI ~${c.baseline_aqi})</option>
+    <option value="${escapeHtml(c.key)}" ${c.key === state.currentCity ? 'selected' : ''}>${escapeHtml(c.name)} (AQI ~${escapeHtml(c.baseline_aqi)})</option>
   `).join('');
 
   const weather = aq.weather || {};
   const pollutants = aq.pollutants || {};
+  const aqColor = safeHexColor(aq.color);
+  const windSpeedVal = weather.wind_speed ?? weather.wind_speed_kmh ?? 4.8;
+  const generalAdvisory = typeof aq.health_advisory === 'string'
+    ? aq.health_advisory
+    : (aq.health_advisory?.general_population || 'Respiratory discomfort risk on prolonged exposure. Avoid strenuous outdoor activities.');
+  const sensitiveAdvisory = typeof aq.sensitive_advisory === 'string'
+    ? aq.sensitive_advisory
+    : (aq.health_advisory?.sensitive_groups || 'Children, seniors and people with respiratory illness should remain indoors with HEPA filtration.');
 
   container.innerHTML = `
     <!-- Page Header & Action Controls -->
@@ -837,25 +1009,25 @@ function renderDashboard(container) {
       <div class="flex flex-wrap items-center gap-2 text-xs">
         <!-- City Select Dropdown -->
         <div class="relative">
-          <select id="city-selector" class="bg-slate-900 border border-slate-700/80 text-slate-200 text-xs rounded-lg px-3 py-2 pr-7 focus:outline-none focus:border-slate-500 cursor-pointer">
+          <select id="city-selector" aria-label="Select monitoring city" class="bg-slate-900 border border-slate-700/80 text-slate-200 text-xs rounded-lg px-3 py-2 pr-7 focus:outline-none focus:border-slate-500 cursor-pointer">
             <option value="" disabled ${state.userCoords ? 'selected' : ''}>Select City</option>
             ${cityOptions}
           </select>
         </div>
 
         <!-- Location Button -->
-        <button id="btn-gps-loc" class="btn-gps-trigger bg-slate-900 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-700/80 text-xs font-medium px-3 py-2 rounded-lg flex items-center gap-1.5 transition">
+        <button id="btn-gps-loc" type="button" class="btn-gps-trigger bg-slate-900 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-700/80 text-xs font-medium px-3 py-2 rounded-lg flex items-center gap-1.5 transition">
           ${icons.crosshair}
           <span>Location</span>
         </button>
 
         <!-- Temperature Unit Toggle -->
-        <button id="btn-temp-unit" class="bg-slate-900 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-700/80 text-xs font-medium px-2.5 py-2 rounded-lg transition" title="Toggle unit">
+        <button id="btn-temp-unit" type="button" aria-label="Toggle Celsius or Fahrenheit" class="bg-slate-900 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-700/80 text-xs font-medium px-2.5 py-2 rounded-lg transition" title="Toggle unit">
           ${state.tempUnit === 'C' ? '°C' : '°F'}
         </button>
 
         <!-- Scenarios Link -->
-        <button onclick="window.hawawiseNavigate('demo_mode')" class="bg-slate-900 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-700/80 text-xs font-medium px-3 py-2 rounded-lg flex items-center gap-1.5 transition">
+        <button type="button" onclick="window.vayusaathiNavigate('demo_mode')" class="bg-slate-900 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-700/80 text-xs font-medium px-3 py-2 rounded-lg flex items-center gap-1.5 transition">
           ${icons.play}
           <span>Scenarios</span>
         </button>
@@ -866,22 +1038,22 @@ function renderDashboard(container) {
     <div class="mb-5 p-3 rounded-lg border border-slate-800/80 bg-slate-900/40 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs text-slate-400">
       <div class="flex items-center gap-2 flex-wrap">
         <span class="w-1.5 h-1.5 rounded-full ${state.userCoords ? 'bg-cyan-400' : 'bg-emerald-500'}"></span>
-        <span class="text-slate-200 font-medium">${state.userCoords?.locality || aq.city}</span>
+        <span class="text-slate-200 font-medium">${escapeHtml(state.userCoords?.locality || aq.city)}</span>
         <span class="text-slate-500">·</span>
         <span class="text-slate-400">${(aq.coordinates?.lat ?? 28.614).toFixed(3)}°N, ${(aq.coordinates?.lon ?? 77.209).toFixed(3)}°E</span>
         ${state.userCoords ? `
           <span class="text-cyan-400 text-[11px] font-medium">(±${state.userCoords.accuracy}m accuracy)</span>
-          <button id="btn-clear-gps" class="text-slate-400 hover:text-slate-200 underline text-[11px] ml-1">Reset</button>
+          <button id="btn-clear-gps" type="button" class="text-slate-400 hover:text-slate-200 underline text-[11px] ml-1">Reset</button>
         ` : ''}
         ${state.nearestStation ? `
           <span class="text-slate-500">·</span>
-          <span class="text-slate-400">Nearest: <strong class="text-slate-300">${state.nearestStation.station.name}</strong> (${state.nearestStation.distanceKm} km)</span>
+          <span class="text-slate-400">Nearest: <strong class="text-slate-300">${escapeHtml(state.nearestStation.station.name)}</strong> (${state.nearestStation.distanceKm} km)</span>
         ` : ''}
       </div>
 
       <div class="flex items-center gap-2 text-[11px] text-slate-500">
-        <button onclick="window.hawawiseNavigate('map')" class="text-slate-300 hover:text-white underline font-medium flex items-center gap-1">
-          <span>View on Station Map</span> →
+        <button type="button" onclick="window.vayusaathiNavigate('map')" class="text-slate-300 hover:text-white underline font-medium flex items-center gap-1">
+          <span>View on Google Map</span> →
         </button>
       </div>
     </div>
@@ -892,12 +1064,12 @@ function renderDashboard(container) {
         <div class="flex flex-col sm:flex-row sm:items-start justify-between gap-3">
           <div class="min-w-0">
             <h2 class="text-xs font-semibold uppercase tracking-wider text-cyan-300">AI briefing for your GPS location</h2>
-            <p class="text-[11px] ${state.userCoords.accuracy <= 150 ? 'text-emerald-300' : 'text-amber-300'} mt-1">${state.userCoords.accuracy <= 150 ? 'High-accuracy GPS fix' : 'Approximate location fix'} (±${state.userCoords.accuracy} m) · Coordinate-based air-quality estimate, not a sensor at your exact position · Updated ${aq.last_updated || aq.timestamp || 'recently'}</p>
-            ${!aq.is_live ? '<p class="text-[11px] text-amber-300 mt-1">Live air-quality service is unavailable; showing baseline data instead.</p>' : ''}
+            <p class="text-[11px] ${state.userCoords.accuracy <= 150 ? 'text-emerald-300' : 'text-amber-300'} mt-1">${state.userCoords.accuracy <= 150 ? 'High-accuracy GPS fix' : 'Approximate location fix'} (±${state.userCoords.accuracy} m) · Coordinate-based air-quality estimate · Updated ${escapeHtml(aq.last_updated || aq.timestamp || 'recently')}</p>
+            ${!aq.is_live ? '<p class="text-[11px] text-amber-300 mt-1">Live air-quality service is unavailable; showing calibrated baseline data.</p>' : ''}
             <p id="gps-ai-briefing-text" class="text-xs text-slate-300 leading-relaxed mt-3 whitespace-pre-line"></p>
-            ${state.gpsInsightProvider ? `<p class="text-[10px] text-slate-500 mt-2">Assistant: ${state.gpsInsightProvider}</p>` : ''}
+            ${state.gpsInsightProvider ? `<p class="text-[10px] text-slate-500 mt-2">Assistant: ${escapeHtml(state.gpsInsightProvider)}</p>` : ''}
           </div>
-          <button id="btn-gps-ai-refresh" class="shrink-0 text-xs font-medium px-3 py-2 rounded-lg border border-slate-700 bg-slate-900 hover:bg-slate-800 text-slate-200 transition disabled:opacity-50" ${state.gpsInsightLoading ? 'disabled' : ''}>
+          <button id="btn-gps-ai-refresh" type="button" class="shrink-0 text-xs font-medium px-3 py-2 rounded-lg border border-slate-700 bg-slate-900 hover:bg-slate-800 text-slate-200 transition disabled:opacity-50" ${state.gpsInsightLoading ? 'disabled' : ''}>
             ${state.gpsInsightLoading ? 'Analyzing…' : 'Refresh AI briefing'}
           </button>
         </div>
@@ -911,7 +1083,7 @@ function renderDashboard(container) {
         <div class="text-xs">
           <div class="font-semibold text-rose-300">Boundary Layer Temperature Inversion Active</div>
           <div class="text-slate-400 mt-0.5 leading-relaxed">
-            Cold surface air is trapped beneath a warmer overhead layer with calm wind (${weather.wind_speed} km/h).
+            Cold surface air is trapped beneath a warmer overhead layer with calm wind (${escapeHtml(windSpeedVal)} km/h).
             Particulates cannot disperse vertically, causing acute ground-level concentration. Avoid morning outdoor jogging.
           </div>
         </div>
@@ -928,28 +1100,28 @@ function renderDashboard(container) {
             <div>
               <span class="text-[11px] uppercase tracking-wider text-slate-400 font-medium">National AQI (CPCB)</span>
               <div class="flex items-baseline gap-3 mt-1.5">
-                <span class="text-4xl font-bold tracking-tight" style="color: ${aq.color}">${aq.aqi}</span>
-                <span class="text-xs font-semibold px-2 py-0.5 rounded-md border" style="border-color: ${aq.color}40; background-color: ${aq.color}15; color: ${aq.color}">
-                  ${aq.category}
+                <span class="text-4xl font-bold tracking-tight" style="color: ${aqColor}">${escapeHtml(aq.aqi)}</span>
+                <span data-aqi-badge class="text-xs font-semibold px-2 py-0.5 rounded-md border" style="border-color: ${aqColor}40; background-color: ${aqColor}15; color: ${aqColor}">
+                  ${escapeHtml(aq.category)}
                 </span>
               </div>
             </div>
             <div class="text-right">
               <span class="text-[11px] text-slate-500">Dominant</span>
-              <div class="text-xs font-semibold text-slate-300 mt-0.5">${aq.dominant_pollutant}</div>
+              <div class="text-xs font-semibold text-slate-300 mt-0.5">${escapeHtml(aq.dominant_pollutant || 'PM2.5')}</div>
             </div>
           </div>
 
           <div class="mt-4 pt-3 border-t border-slate-800">
             <p class="text-xs text-slate-300 leading-relaxed">
-              "${typeof aq.health_advisory === 'string' ? aq.health_advisory : (aq.health_advisory?.general_population || 'Respiratory discomfort risk on prolonged exposure. Avoid strenuous outdoor activities.')}"
+              "${escapeHtml(generalAdvisory)}"
             </p>
           </div>
         </div>
 
         <div class="mt-3 text-[11px] text-slate-400 pt-2 border-t border-slate-800/60 flex items-center gap-1.5">
           <span class="text-amber-400 shrink-0 font-medium">Note:</span>
-          <span class="text-slate-400">${typeof aq.sensitive_advisory === 'string' ? aq.sensitive_advisory : (aq.health_advisory?.sensitive_groups || 'Children, seniors and people with respiratory illness should remain indoors with HEPA filtration.')}</span>
+          <span class="text-slate-400">${escapeHtml(sensitiveAdvisory)}</span>
         </div>
       </div>
 
@@ -958,21 +1130,21 @@ function renderDashboard(container) {
         <div>
           <div class="flex items-center justify-between text-[11px] uppercase tracking-wider text-slate-400 font-medium">
             <span>Atmospheric Conditions</span>
-            <span class="text-slate-300 font-normal capitalize">${weather.condition || 'Mist / Shallow Fog'}</span>
+            <span class="text-slate-300 font-normal capitalize">${escapeHtml(weather.condition || weather.weather_condition || 'Mist / Shallow Fog')}</span>
           </div>
 
           <div class="my-3">
             <div class="text-3xl font-bold tracking-tight text-white">${formatTemp(weather.temperature !== undefined ? weather.temperature : weather.temperature_c)}</div>
-            <div class="text-xs text-slate-400 mt-0.5">Feels like <strong class="text-slate-300 font-medium">${formatTemp(weather.apparent_temperature !== undefined ? weather.apparent_temperature : (weather.temperature || 16) - 1.5)}</strong></div>
+            <div class="text-xs text-slate-400 mt-0.5">Feels like <strong class="text-slate-300 font-medium">${formatTemp(weather.apparent_temperature !== undefined ? weather.apparent_temperature : (weather.temperature || weather.temperature_c || 16) - 1.5)}</strong></div>
           </div>
         </div>
 
         <div class="grid grid-cols-2 gap-x-4 gap-y-1.5 text-xs border-t border-slate-800 pt-3 text-slate-400">
-          <div>Humidity: <strong class="text-slate-200 font-medium">${weather.humidity !== undefined ? weather.humidity : (weather.humidity_percent || 78)}%</strong></div>
-          <div>Wind: <strong class="text-slate-200 font-medium">${weather.wind_speed !== undefined ? weather.wind_speed : (weather.wind_speed_kmh || 4.8)} km/h ${weather.wind_direction_cardinal || ''}</strong></div>
-          <div>Pressure: <strong class="text-slate-200 font-medium">${weather.pressure_hpa || 1016} hPa</strong></div>
-          <div>Visibility: <strong class="text-slate-200 font-medium">${weather.visibility_km || 2.5} km</strong></div>
-          <div>UV Index: <strong class="text-slate-200 font-medium">${weather.uv_index || 3.0}</strong></div>
+          <div>Humidity: <strong class="text-slate-200 font-medium">${escapeHtml(weather.humidity ?? weather.humidity_percent ?? 78)}%</strong></div>
+          <div>Wind: <strong class="text-slate-200 font-medium">${escapeHtml(windSpeedVal)} km/h ${escapeHtml(weather.wind_direction_cardinal || '')}</strong></div>
+          <div>Pressure: <strong class="text-slate-200 font-medium">${escapeHtml(weather.pressure_hpa ?? weather.pressure ?? 1016)} hPa</strong></div>
+          <div>Visibility: <strong class="text-slate-200 font-medium">${escapeHtml(weather.visibility_km ?? weather.visibility ?? 2.5)} km</strong></div>
+          <div>UV Index: <strong class="text-slate-200 font-medium">${escapeHtml(weather.uv_index ?? 3.0)}</strong></div>
           <div>Inversion: <strong class="${weather.temperature_inversion_detected ? 'text-rose-400' : 'text-emerald-400'} font-medium">${weather.temperature_inversion_detected ? 'Active' : 'Normal'}</strong></div>
         </div>
       </div>
@@ -992,9 +1164,9 @@ function renderDashboard(container) {
           </div>
         </div>
 
-        <div class="text-xs text-slate-300 bg-slate-900/60 p-2.5 rounded-lg border border-slate-800 flex items-center justify-between">
+        <div class="text-xs text-slate-300 bg-slate-900/60 p-2.5 rounded-lg border border-slate-800 flex items-center justify-between gap-2">
           <span class="text-slate-400">Optimal airing window:</span>
-          <strong class="text-slate-200 font-semibold">${weather.optimal_ventilation_window || '1:00 PM – 2:30 PM (Midday Solar Mixing)'}</strong>
+          <strong class="text-slate-200 font-semibold text-right">${escapeHtml(weather.optimal_ventilation_window || '1:00 PM – 2:30 PM (Midday Solar Mixing)')}</strong>
         </div>
       </div>
 
@@ -1005,7 +1177,7 @@ function renderDashboard(container) {
       <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-1 mb-4">
         <div>
           <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-300">
-            Monitored Pollutants & 24-Hour Benchmark
+            Monitored Pollutants &amp; 24-Hour Benchmark
           </h2>
           <p class="text-[11px] text-slate-500 mt-0.5">
             Calculated against Central Pollution Control Board (CPCB) standard breakpoints.
@@ -1033,7 +1205,7 @@ function renderDashboard(container) {
             24-Hour Diurnal Curve
           </h2>
           <p class="text-[11px] text-slate-500 mt-0.5">
-            Diurnal curve showing nocturnal thermal trapping (06:00–09:00 & 20:00–23:00) vs afternoon dilution.
+            Diurnal curve showing nocturnal thermal trapping (06:00–09:00 &amp; 20:00–23:00) vs afternoon dilution.
           </p>
         </div>
         <div class="flex items-center gap-4 text-xs text-slate-400">
@@ -1043,13 +1215,13 @@ function renderDashboard(container) {
       </div>
 
       <div class="relative h-60 w-full">
-        <canvas id="trendChart"></canvas>
+        <canvas id="trendChart" aria-label="24-hour AQI and PM2.5 diurnal chart"></canvas>
       </div>
     </div>
 
     <!-- Quick Navigation Shortcuts -->
     <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-      <div class="glass-panel glass-panel-hover p-4 cursor-pointer" onclick="window.hawawiseNavigate('assistant')">
+      <div role="button" tabindex="0" class="glass-panel glass-panel-hover p-4 cursor-pointer" onclick="window.vayusaathiNavigate('assistant')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();window.vayusaathiNavigate('assistant');}">
         <div class="flex items-start gap-3">
           <div class="w-8 h-8 rounded-lg bg-slate-900 border border-slate-700/80 text-slate-300 flex items-center justify-center shrink-0">
             ${icons.chat}
@@ -1061,7 +1233,7 @@ function renderDashboard(container) {
         </div>
       </div>
 
-      <div class="glass-panel glass-panel-hover p-4 cursor-pointer" onclick="window.hawawiseNavigate('family')">
+      <div role="button" tabindex="0" class="glass-panel glass-panel-hover p-4 cursor-pointer" onclick="window.vayusaathiNavigate('family')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();window.vayusaathiNavigate('family');}">
         <div class="flex items-start gap-3">
           <div class="w-8 h-8 rounded-lg bg-slate-900 border border-slate-700/80 text-slate-300 flex items-center justify-center shrink-0">
             ${icons.shield}
@@ -1073,7 +1245,7 @@ function renderDashboard(container) {
         </div>
       </div>
 
-      <div class="glass-panel glass-panel-hover p-4 cursor-pointer" onclick="window.hawawiseNavigate('routine')">
+      <div role="button" tabindex="0" class="glass-panel glass-panel-hover p-4 cursor-pointer" onclick="window.vayusaathiNavigate('routine')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();window.vayusaathiNavigate('routine');}">
         <div class="flex items-start gap-3">
           <div class="w-8 h-8 rounded-lg bg-slate-900 border border-slate-700/80 text-slate-300 flex items-center justify-center shrink-0">
             ${icons.calendar}
@@ -1102,6 +1274,7 @@ function renderDashboard(container) {
   if (selector) {
     selector.addEventListener('change', async (e) => {
       state.userCoords = null;
+      state.nearestStation = null;
       state.gpsInsight = '';
       state.gpsInsightProvider = '';
       state.gpsInsightRequestId += 1;
@@ -1123,8 +1296,7 @@ function renderDashboard(container) {
   if (tempBtn) {
     tempBtn.addEventListener('click', () => {
       state.tempUnit = state.tempUnit === 'C' ? 'F' : 'C';
-      localStorage.setItem('vayusaathi_temp_unit', state.tempUnit);
-      localStorage.setItem('hawawise_temp_unit', state.tempUnit);
+      try { localStorage.setItem('vayusaathi_temp_unit', state.tempUnit); } catch (e) {}
       renderDashboard(container);
     });
   }
@@ -1133,6 +1305,7 @@ function renderDashboard(container) {
   if (clearGps) {
     clearGps.addEventListener('click', async () => {
       state.userCoords = null;
+      state.nearestStation = null;
       state.gpsInsight = '';
       state.gpsInsightProvider = '';
       state.gpsInsightLoading = false;
@@ -1162,31 +1335,32 @@ function renderDashboard(container) {
 
 function renderPollutantCard(name, data, color, desc) {
   if (!data) return '';
-  const limit = data.safe_limit || data.cpcb_limit || 60.0;
-  const val = data.value !== undefined ? data.value : 0;
+  const limit = Number(data.safe_limit || data.cpcb_limit || 60.0) || 60.0;
+  const val = Number(data.value !== undefined ? data.value : 0) || 0;
   const ratio = Math.round((val / limit) * 100);
   const isHigh = ratio > 100;
+  const validColor = safeHexColor(color);
 
   return `
     <div class="bg-slate-900/50 border border-slate-800 rounded-lg p-3 flex flex-col justify-between">
       <div>
         <div class="flex items-center justify-between text-xs">
-          <span class="font-semibold text-slate-200">${name}</span>
-          <span class="text-[10px] text-slate-500">${data.unit || 'µg/m³'}</span>
+          <span class="font-semibold text-slate-200">${escapeHtml(name)}</span>
+          <span class="text-[10px] text-slate-500">${escapeHtml(data.unit || 'µg/m³')}</span>
         </div>
-        <div class="text-lg font-bold tracking-tight mt-1" style="color: ${isHigh ? color : '#10b981'}">
-          ${val}
+        <div class="text-lg font-bold tracking-tight mt-1" style="color: ${isHigh ? validColor : '#10b981'}">
+          ${escapeHtml(val)}
         </div>
-        <div class="text-[10px] text-slate-500 truncate" title="${desc}">${desc}</div>
+        <div class="text-[10px] text-slate-500 truncate" title="${escapeHtml(desc)}">${escapeHtml(desc)}</div>
       </div>
 
       <div class="mt-3 pt-2 border-t border-slate-800/80">
         <div class="flex justify-between text-[10px] text-slate-500 mb-1">
-          <span>Limit ${limit}</span>
+          <span>Limit ${escapeHtml(limit)}</span>
           <span class="${isHigh ? 'text-rose-400 font-medium' : 'text-slate-400'}">${ratio}%</span>
         </div>
         <div class="w-full bg-slate-800 rounded-full h-1 overflow-hidden">
-          <div class="h-1 rounded-full" style="width: ${Math.min(ratio, 100)}%; background-color: ${isHigh ? color : '#10b981'}"></div>
+          <div class="h-1 rounded-full" style="width: ${Math.min(ratio, 100)}%; background-color: ${isHigh ? validColor : '#10b981'}"></div>
         </div>
       </div>
     </div>
@@ -1275,49 +1449,102 @@ function initTrendChart(trendData) {
 /* =========================================================================
    2. AIR QUALITY MAP VIEW (Fully Functional Spatial Network & Geolocation)
    ========================================================================= */
-function renderAirQualityMap(container) {
-  // Compute distance for all stations relative to user if available
+function getFilteredStations() {
   const userLat = state.userCoords?.lat;
   const userLon = state.userCoords?.lon;
 
-  const processedStations = ALL_STATIONS.map(st => {
-    const dist = (userLat && userLon) ? getDistanceKm(userLat, userLon, st.lat, st.lon) : null;
-    return { ...st, distanceKm: dist };
-  });
+  let stations = ALL_STATIONS.map(st => ({
+    ...st,
+    distanceKm: (userLat && userLon) ? getDistanceKm(userLat, userLon, st.lat, st.lon) : null
+  }));
 
-  // Apply Search Filter
-  let filtered = processedStations;
   if (state.mapSearchQuery.trim()) {
     const q = state.mapSearchQuery.toLowerCase().trim();
-    filtered = filtered.filter(st => 
-      st.name.toLowerCase().includes(q) || 
-      st.city.toLowerCase().includes(q) || 
+    stations = stations.filter(st =>
+      st.name.toLowerCase().includes(q) ||
+      st.city.toLowerCase().includes(q) ||
       st.reason.toLowerCase().includes(q)
     );
   }
 
-  // Apply AQI Level Filter
-  if (state.mapFilter === 'severe') {
-    filtered = filtered.filter(st => st.aqi >= 401);
-  } else if (state.mapFilter === 'very_poor') {
-    filtered = filtered.filter(st => st.aqi >= 301 && st.aqi <= 400);
-  } else if (state.mapFilter === 'poor_mod') {
-    filtered = filtered.filter(st => st.aqi >= 101 && st.aqi <= 300);
-  } else if (state.mapFilter === 'good') {
-    filtered = filtered.filter(st => st.aqi <= 100);
-  }
+  if (state.mapFilter === 'severe') stations = stations.filter(st => st.aqi >= 401);
+  else if (state.mapFilter === 'very_poor') stations = stations.filter(st => st.aqi >= 301 && st.aqi <= 400);
+  else if (state.mapFilter === 'poor_mod') stations = stations.filter(st => st.aqi >= 101 && st.aqi <= 300);
+  else if (state.mapFilter === 'good') stations = stations.filter(st => st.aqi <= 100);
 
-  // Sort
   if (state.mapSort === 'proximity' && userLat && userLon) {
-    filtered.sort((a, b) => (a.distanceKm || 9999) - (b.distanceKm || 9999));
+    stations.sort((a, b) => (a.distanceKm || 9999) - (b.distanceKm || 9999));
   } else if (state.mapSort === 'aqi_desc') {
-    filtered.sort((a, b) => b.aqi - a.aqi);
+    stations.sort((a, b) => b.aqi - a.aqi);
   } else if (state.mapSort === 'aqi_asc') {
-    filtered.sort((a, b) => a.aqi - b.aqi);
+    stations.sort((a, b) => a.aqi - b.aqi);
   } else if (state.mapSort === 'name') {
-    filtered.sort((a, b) => a.name.localeCompare(b.name));
+    stations.sort((a, b) => a.name.localeCompare(b.name));
   }
 
+  return stations;
+}
+
+function getStationAqiColor(aqi) {
+  if (aqi > 400) return '#f43f5e';
+  if (aqi > 300) return '#ef4444';
+  if (aqi > 200) return '#f97316';
+  if (aqi > 100) return '#f59e0b';
+  return '#10b981';
+}
+
+function renderStationCardsHtml(stations) {
+  if (!stations || stations.length === 0) {
+    return `<div class="col-span-full py-8 text-center text-xs text-slate-500">No monitoring stations match your search query or active filter.</div>`;
+  }
+
+  return stations.map(s => {
+    const catColor = getStationAqiColor(s.aqi);
+    const safeId = escapeHtml(s.id);
+    return `
+      <div class="glass-panel p-4 flex flex-col justify-between hover:border-slate-700 transition">
+        <div>
+          <div class="flex items-start justify-between gap-2">
+            <div>
+              <h3 class="text-xs font-semibold text-white">${escapeHtml(s.name)}</h3>
+              <div class="text-[10px] text-slate-500 mt-0.5">${escapeHtml(s.city)}</div>
+            </div>
+            <span data-aqi-badge class="text-[11px] font-semibold px-2 py-0.5 rounded border shrink-0" style="color: ${catColor}; border-color: ${catColor}40; background-color: ${catColor}15;">
+              AQI ${escapeHtml(s.aqi)}
+            </span>
+          </div>
+
+          <div class="flex items-center gap-3 text-xs text-slate-400 mt-2.5">
+            <div>PM2.5: <strong class="text-slate-200">${escapeHtml(s.pm25)} µg/m³</strong></div>
+            <div>PM10: <strong class="text-slate-200">${escapeHtml(s.pm10)} µg/m³</strong></div>
+          </div>
+
+          ${s.distanceKm !== null ? `
+            <div class="mt-1.5 text-[11px] text-cyan-400 font-medium">
+              ${escapeHtml(s.distanceKm)} km from your position
+            </div>
+          ` : ''}
+
+          <p class="text-xs text-slate-400 mt-2 leading-relaxed">${escapeHtml(s.reason)}</p>
+        </div>
+
+        <div class="mt-3.5 pt-2.5 border-t border-slate-800/80 flex items-center justify-between text-xs">
+          <button type="button" class="text-slate-300 hover:text-white font-medium" onclick="window.selectStationById('${safeId}')">
+            Set Active →
+          </button>
+          <button type="button" class="text-slate-400 hover:text-slate-200 text-[11px]" onclick="window.focusStationOnMap('${safeId}')">
+            Focus on Map
+          </button>
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+function renderAirQualityMap(container) {
+  const userLat = state.userCoords?.lat;
+  const userLon = state.userCoords?.lon;
+  const filtered = getFilteredStations();
   const nearest = (userLat && userLon) ? findNearestStation(userLat, userLon) : null;
 
   container.innerHTML = `
@@ -1325,39 +1552,35 @@ function renderAirQualityMap(container) {
     <div class="mb-5 flex flex-col md:flex-row md:items-center justify-between gap-4">
       <div>
         <h1 class="text-xl md:text-2xl font-semibold tracking-tight text-white flex items-center gap-2">
-          <span>Station Network & Google Map</span>
+          <span>Station Network &amp; Google Map</span>
           <span class="text-[11px] font-semibold text-emerald-400 bg-emerald-500/10 border border-emerald-500/20 px-2 py-0.5 rounded-full flex items-center gap-1.5 font-normal">
             <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span> Google Maps Engine
           </span>
         </h1>
         <p class="text-xs text-slate-400 mt-0.5">
-          High-accuracy Google Maps spatial environmental monitoring, satellite positioning & CPCB national station network.
+          High-accuracy Google Maps spatial environmental monitoring, satellite positioning &amp; CPCB national station network.
         </p>
       </div>
 
       <!-- Quick Action Controls -->
       <div class="flex flex-wrap items-center gap-2 text-xs">
-        <!-- High-Precision Locate Me -->
-        <button id="btn-map-locate" class="btn-gps-trigger bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-700 px-3 py-1.5 rounded-lg transition font-medium flex items-center gap-1.5">
+        <button id="btn-map-locate" type="button" class="btn-gps-trigger bg-slate-900 hover:bg-slate-800 text-slate-200 border border-slate-700 px-3 py-1.5 rounded-lg transition font-medium flex items-center gap-1.5">
           ${icons.crosshair}
           <span>Locate Me</span>
         </button>
 
-        <!-- Continuous Live Tracking Toggle -->
-        <button id="btn-map-track" class="px-3 py-1.5 rounded-lg transition font-medium flex items-center gap-1.5 border ${state.isTracking ? 'bg-cyan-500/10 text-cyan-300 border-cyan-500/40' : 'bg-slate-900 hover:bg-slate-800 text-slate-400 border-slate-700'}">
+        <button id="btn-map-track" type="button" class="px-3 py-1.5 rounded-lg transition font-medium flex items-center gap-1.5 border ${state.isTracking ? 'bg-cyan-500/10 text-cyan-300 border-cyan-500/40' : 'bg-slate-900 hover:bg-slate-800 text-slate-400 border-slate-700'}">
           <span class="w-2 h-2 rounded-full ${state.isTracking ? 'bg-cyan-400 animate-ping' : 'bg-slate-500'}"></span>
           <span>${state.isTracking ? 'Live Tracking On' : 'Live Tracking'}</span>
         </button>
 
-        <!-- Nearest Station Finder -->
-        <button id="btn-map-nearest" class="bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-700 px-3 py-1.5 rounded-lg transition font-medium flex items-center gap-1.5" title="Find and focus on the closest CPCB monitoring station">
+        <button id="btn-map-nearest" type="button" class="bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-700 px-3 py-1.5 rounded-lg transition font-medium flex items-center gap-1.5" title="Find and focus on the closest CPCB monitoring station">
           ${icons.navigation}
           <span>Nearest Station</span>
         </button>
 
-        <!-- Google Map Style Selector -->
         <div class="relative flex items-center">
-          <select id="map-layer-selector" class="bg-slate-900 border border-slate-700 text-slate-300 text-xs rounded-lg px-2.5 py-1.5 pr-6 focus:outline-none cursor-pointer">
+          <select id="map-layer-selector" aria-label="Select Google Map layer style" class="bg-slate-900 border border-slate-700 text-slate-300 text-xs rounded-lg px-2.5 py-1.5 pr-6 focus:outline-none cursor-pointer">
             <option value="google_streets" ${state.mapLayer === 'google_streets' ? 'selected' : ''}>Google Roadmap</option>
             <option value="google_satellite" ${state.mapLayer === 'google_satellite' ? 'selected' : ''}>Google Satellite</option>
             <option value="google_hybrid" ${state.mapLayer === 'google_hybrid' ? 'selected' : ''}>Google Hybrid</option>
@@ -1368,13 +1591,11 @@ function renderAirQualityMap(container) {
           </select>
         </div>
 
-        <!-- Fullscreen Button -->
-        <button id="btn-map-fullscreen" class="bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-700 p-1.5 rounded-lg transition" title="Toggle Fullscreen Map">
+        <button id="btn-map-fullscreen" type="button" aria-label="Toggle fullscreen map" class="bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-700 p-1.5 rounded-lg transition" title="Toggle Fullscreen Map">
           ${icons.maximize}
         </button>
 
-        <!-- Map Settings Shortcut -->
-        <button onclick="window.vayusaathiNavigate ? window.vayusaathiNavigate('settings') : window.hawawiseNavigate('settings')" class="bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-white border border-slate-700 p-1.5 rounded-lg transition" title="Open Map & API Settings">
+        <button type="button" aria-label="Open map and API key settings" onclick="window.vayusaathiNavigate('settings')" class="bg-slate-900 hover:bg-slate-800 text-slate-400 hover:text-white border border-slate-700 p-1.5 rounded-lg transition" title="Open Map & API Settings">
           ${icons.settings}
         </button>
       </div>
@@ -1386,19 +1607,19 @@ function renderAirQualityMap(container) {
         <span class="w-2 h-2 rounded-full ${state.userCoords ? 'bg-cyan-400' : 'bg-slate-600'}"></span>
         <span>Position:</span>
         <strong class="text-slate-200">
-          ${state.userCoords ? (state.userCoords.locality || `${state.userCoords.lat.toFixed(4)}°N, ${state.userCoords.lon.toFixed(4)}°E`) : 'Not acquired (click Locate Me or click anywhere on the map)'}
+          ${state.userCoords ? escapeHtml(state.userCoords.locality || `${state.userCoords.lat.toFixed(4)}°N, ${state.userCoords.lon.toFixed(4)}°E`) : 'Not acquired (click Locate Me or click anywhere on the map)'}
         </strong>
         ${state.userCoords ? `
           <span class="text-cyan-400 text-[11px]">(Accuracy: ±${state.userCoords.accuracy}m)</span>
         ` : ''}
         ${nearest ? `
           <span class="text-slate-500">·</span>
-          <span>Closest Station: <strong class="text-slate-300">${nearest.station.name}</strong> (${nearest.distanceKm} km)</span>
+          <span>Closest Station: <strong class="text-slate-300">${escapeHtml(nearest.station.name)}</strong> (${nearest.distanceKm} km)</span>
         ` : ''}
       </div>
 
       <div class="flex items-center gap-2 text-[11px]">
-        <span class="text-slate-500">Click anywhere on the map to inspect coordinates & elevation</span>
+        <span class="text-slate-500">Click anywhere on the map to inspect coordinates</span>
       </div>
     </div>
 
@@ -1412,8 +1633,8 @@ function renderAirQualityMap(container) {
           <span class="w-2 h-2 rounded-full bg-blue-500 shadow-sm shadow-blue-500/50"></span>
           <span class="font-medium text-white">Google Maps</span>
           <span class="text-slate-500">·</span>
-          <span class="text-slate-400">Zero-Key Active</span>
-          <a href="#" onclick="window.vayusaathiNavigate ? window.vayusaathiNavigate('settings') : window.hawawiseNavigate('settings'); return false;" class="ml-1 text-cyan-400 hover:underline">Settings →</a>
+          <span class="text-slate-400">${state.googleMapsKey ? 'Keyed Cloud Mode' : 'Zero-Key Active'}</span>
+          <a href="#settings" onclick="window.vayusaathiNavigate('settings'); return false;" class="ml-1 text-cyan-400 hover:underline">Settings →</a>
         </div>
       </div>
 
@@ -1441,7 +1662,8 @@ function renderAirQualityMap(container) {
           <input 
             type="text" 
             id="station-search" 
-            value="${state.mapSearchQuery}" 
+            aria-label="Search monitoring stations"
+            value="${escapeHtml(state.mapSearchQuery)}" 
             placeholder="Search station by name, corridor, or city..." 
             class="w-full bg-slate-900 border border-slate-700/80 rounded-lg pl-8 pr-3 py-1.5 text-xs text-slate-200 focus:outline-none focus:border-slate-500"
           />
@@ -1449,7 +1671,7 @@ function renderAirQualityMap(container) {
 
         <!-- Sort Dropdown -->
         <div class="flex items-center gap-2 text-xs">
-          <label class="text-slate-400">Sort by:</label>
+          <label for="station-sort" class="text-slate-400">Sort by:</label>
           <select id="station-sort" class="bg-slate-900 border border-slate-700 text-slate-300 text-xs rounded-lg px-2.5 py-1.5 focus:outline-none cursor-pointer">
             ${userLat ? '<option value="proximity" ' + (state.mapSort === 'proximity' ? 'selected' : '') + '>Proximity (Nearest First)</option>' : ''}
             <option value="aqi_desc" ${state.mapSort === 'aqi_desc' ? 'selected' : ''}>Highest AQI (Most Severe)</option>
@@ -1462,24 +1684,24 @@ function renderAirQualityMap(container) {
       <!-- AQI Filter Pills -->
       <div class="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-800/60">
         <div class="flex flex-wrap items-center gap-1.5 text-xs">
-          <button data-map-filter="all" onclick="window.setMapFilter('all')" class="px-2.5 py-1 rounded-md text-[11px] font-medium border transition ${state.mapFilter === 'all' ? 'bg-slate-800 text-white border-slate-600' : 'bg-slate-900/60 text-slate-400 border-slate-800 hover:border-slate-700'}">
+          <button type="button" data-map-filter="all" onclick="window.setMapFilter('all')" class="px-2.5 py-1 rounded-md text-[11px] font-medium border transition ${state.mapFilter === 'all' ? 'bg-slate-800 text-white border-slate-600' : 'bg-slate-900/60 text-slate-400 border-slate-800 hover:border-slate-700'}">
             All (${ALL_STATIONS.length})
           </button>
-          <button data-map-filter="severe" onclick="window.setMapFilter('severe')" class="px-2.5 py-1 rounded-md text-[11px] font-medium border transition ${state.mapFilter === 'severe' ? 'bg-slate-800 text-white border-slate-600' : 'bg-slate-900/60 text-slate-400 border-slate-800 hover:border-slate-700'}">
+          <button type="button" data-map-filter="severe" onclick="window.setMapFilter('severe')" class="px-2.5 py-1 rounded-md text-[11px] font-medium border transition ${state.mapFilter === 'severe' ? 'bg-slate-800 text-white border-slate-600' : 'bg-slate-900/60 text-slate-400 border-slate-800 hover:border-slate-700'}">
             Severe (401+)
           </button>
-          <button data-map-filter="very_poor" onclick="window.setMapFilter('very_poor')" class="px-2.5 py-1 rounded-md text-[11px] font-medium border transition ${state.mapFilter === 'very_poor' ? 'bg-slate-800 text-white border-slate-600' : 'bg-slate-900/60 text-slate-400 border-slate-800 hover:border-slate-700'}">
+          <button type="button" data-map-filter="very_poor" onclick="window.setMapFilter('very_poor')" class="px-2.5 py-1 rounded-md text-[11px] font-medium border transition ${state.mapFilter === 'very_poor' ? 'bg-slate-800 text-white border-slate-600' : 'bg-slate-900/60 text-slate-400 border-slate-800 hover:border-slate-700'}">
             Very Poor (301–400)
           </button>
-          <button data-map-filter="poor_mod" onclick="window.setMapFilter('poor_mod')" class="px-2.5 py-1 rounded-md text-[11px] font-medium border transition ${state.mapFilter === 'poor_mod' ? 'bg-slate-800 text-white border-slate-600' : 'bg-slate-900/60 text-slate-400 border-slate-800 hover:border-slate-700'}">
+          <button type="button" data-map-filter="poor_mod" onclick="window.setMapFilter('poor_mod')" class="px-2.5 py-1 rounded-md text-[11px] font-medium border transition ${state.mapFilter === 'poor_mod' ? 'bg-slate-800 text-white border-slate-600' : 'bg-slate-900/60 text-slate-400 border-slate-800 hover:border-slate-700'}">
             Moderate / Poor (101–300)
           </button>
-          <button data-map-filter="good" onclick="window.setMapFilter('good')" class="px-2.5 py-1 rounded-md text-[11px] font-medium border transition ${state.mapFilter === 'good' ? 'bg-slate-800 text-white border-slate-600' : 'bg-slate-900/60 text-slate-400 border-slate-800 hover:border-slate-700'}">
+          <button type="button" data-map-filter="good" onclick="window.setMapFilter('good')" class="px-2.5 py-1 rounded-md text-[11px] font-medium border transition ${state.mapFilter === 'good' ? 'bg-slate-800 text-white border-slate-600' : 'bg-slate-900/60 text-slate-400 border-slate-800 hover:border-slate-700'}">
             Good (0–100)
           </button>
         </div>
 
-        <span class="text-[11px] text-slate-500">
+        <span id="station-count-label" class="text-[11px] text-slate-500">
           Showing ${filtered.length} of ${ALL_STATIONS.length} stations
         </span>
       </div>
@@ -1487,141 +1709,21 @@ function renderAirQualityMap(container) {
 
     <!-- Station Highlights Grid -->
     <div id="station-cards-grid" class="grid grid-cols-1 md:grid-cols-3 gap-4">
-      ${filtered.length === 0 ? `
-        <div class="col-span-3 p-8 text-center text-slate-500 text-xs">No monitoring stations match your search or filter.</div>
-      ` : filtered.map(s => {
-        let catColor = '#10b981';
-        if (s.aqi > 400) catColor = '#f43f5e';
-        else if (s.aqi > 300) catColor = '#ef4444';
-        else if (s.aqi > 200) catColor = '#f97316';
-        else if (s.aqi > 100) catColor = '#f59e0b';
-
-        return `
-          <div class="glass-panel p-4 flex flex-col justify-between hover:border-slate-700 transition">
-            <div>
-              <div class="flex items-start justify-between gap-2">
-                <div>
-                  <h3 class="text-xs font-semibold text-white">${s.name}</h3>
-                  <div class="text-[10px] text-slate-500 mt-0.5">${s.city}</div>
-                </div>
-                <span class="text-[11px] font-semibold px-2 py-0.5 rounded border shrink-0" style="color: ${catColor}; border-color: ${catColor}40; background-color: ${catColor}15;">
-                  AQI ${s.aqi}
-                </span>
-              </div>
-
-              <div class="flex items-center gap-3 text-xs text-slate-400 mt-2.5">
-                <div>PM2.5: <strong class="text-slate-200">${s.pm25} µg/m³</strong></div>
-                <div>PM10: <strong class="text-slate-200">${s.pm10} µg/m³</strong></div>
-              </div>
-
-              ${s.distanceKm !== null ? `
-                <div class="mt-1.5 text-[11px] text-cyan-400 font-medium">
-                  ${s.distanceKm} km from your position
-                </div>
-              ` : ''}
-
-              <p class="text-xs text-slate-400 mt-2 leading-relaxed">${s.reason}</p>
-            </div>
-
-            <div class="mt-3.5 pt-2.5 border-t border-slate-800/80 flex items-center justify-between text-xs">
-              <button class="text-slate-300 hover:text-white font-medium" onclick="window.selectCityFromMap('${s.name}')">
-                Set Active →
-              </button>
-              <button class="text-slate-400 hover:text-slate-200 text-[11px]" onclick="window.focusStationOnMap('${s.id}')">
-                Focus on Map
-              </button>
-            </div>
-          </div>
-        `;
-      }).join('')}
+      ${renderStationCardsHtml(filtered)}
     </div>
   `;
 
-  // Efficient Station Grid & Map Filter Updater (preserves Leaflet instance and input focus)
   window.updateStationCardsAndMarkers = function () {
-    const userLat = state.userCoords?.lat;
-    const userLon = state.userCoords?.lon;
-
-    let stations = ALL_STATIONS.map(st => ({
-      ...st,
-      distanceKm: (userLat && userLon) ? getDistanceKm(userLat, userLon, st.lat, st.lon) : null
-    }));
-
-    if (state.mapSearchQuery.trim()) {
-      const q = state.mapSearchQuery.toLowerCase().trim();
-      stations = stations.filter(st =>
-        st.name.toLowerCase().includes(q) ||
-        st.city.toLowerCase().includes(q) ||
-        st.reason.toLowerCase().includes(q)
-      );
-    }
-
-    if (state.mapFilter === 'severe') stations = stations.filter(st => st.aqi >= 401);
-    else if (state.mapFilter === 'very_poor') stations = stations.filter(st => st.aqi >= 301 && st.aqi <= 400);
-    else if (state.mapFilter === 'poor_mod') stations = stations.filter(st => st.aqi >= 101 && st.aqi <= 300);
-    else if (state.mapFilter === 'good') stations = stations.filter(st => st.aqi <= 100);
-
-    if (state.mapSort === 'proximity' && userLat && userLon) {
-      stations.sort((a, b) => (a.distanceKm || 9999) - (b.distanceKm || 9999));
-    } else if (state.mapSort === 'aqi_desc') {
-      stations.sort((a, b) => b.aqi - a.aqi);
-    } else if (state.mapSort === 'aqi_asc') {
-      stations.sort((a, b) => a.aqi - b.aqi);
-    } else if (state.mapSort === 'name') {
-      stations.sort((a, b) => a.name.localeCompare(b.name));
-    }
+    const stations = getFilteredStations();
 
     const gridEl = document.getElementById('station-cards-grid');
     if (gridEl) {
-      if (stations.length === 0) {
-        gridEl.innerHTML = `<div class="col-span-full py-8 text-center text-xs text-slate-500">No monitoring stations match your search query or active filter.</div>`;
-      } else {
-        gridEl.innerHTML = stations.map(s => {
-          let catColor = '#10b981';
-          if (s.aqi > 400) catColor = '#f43f5e';
-          else if (s.aqi > 300) catColor = '#ef4444';
-          else if (s.aqi > 200) catColor = '#f97316';
-          else if (s.aqi > 100) catColor = '#f59e0b';
+      gridEl.innerHTML = renderStationCardsHtml(stations);
+    }
 
-          return `
-            <div class="glass-panel p-4 flex flex-col justify-between hover:border-slate-700 transition">
-              <div>
-                <div class="flex items-start justify-between gap-2">
-                  <div>
-                    <h3 class="text-xs font-semibold text-white">${s.name}</h3>
-                    <div class="text-[10px] text-slate-500 mt-0.5">${s.city}</div>
-                  </div>
-                  <span class="text-[11px] font-semibold px-2 py-0.5 rounded border shrink-0" style="color: ${catColor}; border-color: ${catColor}40; background-color: ${catColor}15;">
-                    AQI ${s.aqi}
-                  </span>
-                </div>
-
-                <div class="flex items-center gap-3 text-xs text-slate-400 mt-2.5">
-                  <div>PM2.5: <strong class="text-slate-200">${s.pm25} µg/m³</strong></div>
-                  <div>PM10: <strong class="text-slate-200">${s.pm10} µg/m³</strong></div>
-                </div>
-
-                ${s.distanceKm !== null ? `
-                  <div class="mt-1.5 text-[11px] text-cyan-400 font-medium">
-                    ${s.distanceKm} km from your position
-                  </div>
-                ` : ''}
-
-                <p class="text-xs text-slate-400 mt-2 leading-relaxed">${s.reason}</p>
-              </div>
-
-              <div class="mt-3.5 pt-2.5 border-t border-slate-800/80 flex items-center justify-between text-xs">
-                <button class="text-slate-300 hover:text-white font-medium" onclick="window.selectCityFromMap('${s.name}')">
-                  Set Active →
-                </button>
-                <button class="text-slate-400 hover:text-slate-200 text-[11px]" onclick="window.focusStationOnMap('${s.id}')">
-                  Focus on Map
-                </button>
-              </div>
-            </div>
-          `;
-        }).join('');
-      }
+    const countEl = document.getElementById('station-count-label');
+    if (countEl) {
+      countEl.textContent = `Showing ${stations.length} of ${ALL_STATIONS.length} stations`;
     }
 
     if (window.stationMarkersMap) {
@@ -1639,18 +1741,10 @@ function renderAirQualityMap(container) {
 
   // Attach Listeners
   const locateBtn = document.getElementById('btn-map-locate');
-  if (locateBtn) {
-    locateBtn.addEventListener('click', () => {
-      detectUserLocation(false, true);
-    });
-  }
+  if (locateBtn) locateBtn.addEventListener('click', () => detectUserLocation(false, true));
 
   const trackBtn = document.getElementById('btn-map-track');
-  if (trackBtn) {
-    trackBtn.addEventListener('click', () => {
-      toggleLiveTracking();
-    });
-  }
+  if (trackBtn) trackBtn.addEventListener('click', () => toggleLiveTracking());
 
   const nearestBtn = document.getElementById('btn-map-nearest');
   if (nearestBtn) {
@@ -1668,26 +1762,22 @@ function renderAirQualityMap(container) {
   if (layerSelector) {
     layerSelector.addEventListener('change', (e) => {
       state.mapLayer = e.target.value;
-      localStorage.setItem('vayusaathi_map_layer', state.mapLayer);
-      localStorage.setItem('hawawise_map_layer', state.mapLayer);
-      if (window.leafletMapInstance && window.tileLayerInstance) {
+      try { localStorage.setItem('vayusaathi_map_layer', state.mapLayer); } catch (err) {}
+      if (window.leafletMapInstance) {
         updateMapTileLayer(window.leafletMapInstance, state.mapLayer);
       }
     });
   }
 
   const fsBtn = document.getElementById('btn-map-fullscreen');
-  if (fsBtn) {
-    fsBtn.addEventListener('click', () => {
-      window.toggleMapFullscreen();
-    });
-  }
+  if (fsBtn) fsBtn.addEventListener('click', () => window.toggleMapFullscreen());
 
   const searchInput = document.getElementById('station-search');
   if (searchInput) {
+    const debouncedFilter = debounce(() => window.updateStationCardsAndMarkers(), 120);
     searchInput.addEventListener('input', (e) => {
       state.mapSearchQuery = e.target.value;
-      window.updateStationCardsAndMarkers();
+      debouncedFilter();
     });
   }
 
@@ -1699,24 +1789,21 @@ function renderAirQualityMap(container) {
     });
   }
 
-  // Initialize Map
   setTimeout(() => {
     initLeafletMap(filtered);
-  }, 50);
+  }, 40);
 }
 
 function updateMapTileLayer(map, layerKey) {
   if (window.tileLayerInstance) {
-    try {
-      map.removeLayer(window.tileLayerInstance);
-    } catch (e) {}
+    try { map.removeLayer(window.tileLayerInstance); } catch (e) {}
   }
 
   const gmapsKey = state.googleMapsKey || localStorage.getItem('vayusaathi_google_maps_key') || '';
   const keyParam = gmapsKey ? `&key=${encodeURIComponent(gmapsKey)}` : '';
 
   let tileUrl = 'https://mt{s}.google.com/vt/lyrs=m&x={x}&y={y}&z={z}' + keyParam;
-  let attrib = '&copy; <a href="https://maps.google.com" target="_blank" rel="noopener" class="underline text-slate-400">Google Maps</a>';
+  let attrib = '&copy; <a href="https://maps.google.com" target="_blank" rel="noopener noreferrer" class="underline text-slate-400">Google Maps</a>';
   let subdomains = ['0', '1', '2', '3'];
   let maxZoom = 20;
 
@@ -1752,7 +1839,7 @@ function updateMapTileLayer(map, layerKey) {
     case 'google_streets':
     default:
       tileUrl = 'https://mt{s}.google.com/vt/lyrs=m&x={x}&y={y}&z={z}' + keyParam;
-      attrib = '&copy; <a href="https://maps.google.com" target="_blank" rel="noopener" class="underline text-slate-400">Google Maps</a>';
+      attrib = '&copy; <a href="https://maps.google.com" target="_blank" rel="noopener noreferrer" class="underline text-slate-400">Google Maps</a>';
       break;
   }
 
@@ -1764,23 +1851,22 @@ function updateMapTileLayer(map, layerKey) {
 }
 
 function initLeafletMap(stations) {
-  if (!window.L) return;
   const mapEl = document.getElementById('mapContainer');
   if (!mapEl) return;
 
-  // Safe removal of old instance to prevent "Map container is already initialized"
+  if (!window.L) {
+    mapEl.innerHTML = `<div class="h-full flex items-center justify-center text-center p-6 text-xs text-slate-400 bg-slate-950/60">Interactive map tiles require an active internet connection. All ${ALL_STATIONS.length} CPCB station metrics remain accessible in the directory below.</div>`;
+    return;
+  }
+
   if (window.leafletMapInstance) {
-    try {
-      window.leafletMapInstance.remove();
-    } catch (e) {
-      // ignore
-    }
+    try { window.leafletMapInstance.remove(); } catch (e) {}
     window.leafletMapInstance = null;
   }
 
   const initialLat = state.userCoords ? state.userCoords.lat : 28.6139;
   const initialLon = state.userCoords ? state.userCoords.lon : 77.2090;
-  const initialZoom = state.userCoords ? 12 : 11;
+  const initialZoom = state.userCoords ? Math.max(state.mapZoomLevel || 11, 12) : (state.mapZoomLevel || 11);
 
   const map = L.map('mapContainer', {
     zoomControl: true,
@@ -1790,31 +1876,21 @@ function initLeafletMap(stations) {
   window.leafletMapInstance = map;
   window.stationMarkersMap = {};
 
-  // Attach Tile Layer
   updateMapTileLayer(map, state.mapLayer);
-
-  // Add Scale Control
   L.control.scale({ imperial: false, metric: true, position: 'bottomleft' }).addTo(map);
 
-  // User Marker & Accuracy Circle if position exists
   if (state.userCoords) {
     updateMapUserPosition(
-      state.userCoords.lat, 
-      state.userCoords.lon, 
-      state.userCoords.accuracy, 
+      state.userCoords.lat,
+      state.userCoords.lon,
+      state.userCoords.accuracy,
       state.userCoords.locality,
       state.nearestStation
     );
   }
 
-  // Add Stations
   stations.forEach(st => {
-    let color = '#10B981';
-    if (st.aqi > 400) color = '#f43f5e';
-    else if (st.aqi > 300) color = '#ef4444';
-    else if (st.aqi > 200) color = '#f97316';
-    else if (st.aqi > 100) color = '#f59e0b';
-
+    const color = getStationAqiColor(st.aqi);
     const circle = L.circleMarker([st.lat, st.lon], {
       radius: st.aqi > 400 ? 10 : 8,
       fillColor: color,
@@ -1825,21 +1901,22 @@ function initLeafletMap(stations) {
     }).addTo(map);
 
     window.stationMarkersMap[st.id] = circle;
+    const safeId = escapeHtml(st.id);
 
     circle.bindPopup(`
       <div class="p-1 min-w-[200px]">
-        <h4 class="font-semibold text-xs text-slate-100">${st.name}</h4>
+        <h4 class="font-semibold text-xs text-slate-100">${escapeHtml(st.name)}</h4>
         <div class="text-[11px] mt-1">
-          AQI: <strong style="color: ${color}">${st.aqi}</strong> 
-          <span class="text-slate-400">(${st.cat})</span>
+          AQI: <strong style="color: ${color}">${escapeHtml(st.aqi)}</strong>
+          <span class="text-slate-400">(${escapeHtml(st.cat)})</span>
         </div>
-        <div class="text-[11px] text-slate-400 mt-0.5">PM2.5: <strong class="text-slate-200">${st.pm25} µg/m³</strong> • PM10: ${st.pm10} µg/m³</div>
+        <div class="text-[11px] text-slate-400 mt-0.5">PM2.5: <strong class="text-slate-200">${escapeHtml(st.pm25)} µg/m³</strong> • PM10: ${escapeHtml(st.pm10)} µg/m³</div>
         ${st.distanceKm !== null && st.distanceKm !== undefined ? `
-          <div class="text-[11px] text-cyan-400 mt-1 font-medium">Distance: ${st.distanceKm} km from you</div>
+          <div class="text-[11px] text-cyan-400 mt-1 font-medium">Distance: ${escapeHtml(st.distanceKm)} km from you</div>
         ` : ''}
-        <p class="text-[11px] text-slate-400 mt-1.5 leading-relaxed">${st.reason}</p>
+        <p class="text-[11px] text-slate-400 mt-1.5 leading-relaxed">${escapeHtml(st.reason)}</p>
         <div class="mt-2.5 pt-2 border-t border-slate-800">
-          <button onclick="window.selectCityFromMap('${st.name}')" class="w-full bg-slate-800 hover:bg-slate-700 text-white text-xs font-medium py-1 px-2 rounded transition">
+          <button type="button" onclick="window.selectStationById('${safeId}')" class="w-full bg-slate-800 hover:bg-slate-700 text-white text-xs font-medium py-1 px-2 rounded transition">
             Set as Active Location
           </button>
         </div>
@@ -1847,13 +1924,11 @@ function initLeafletMap(stations) {
     `);
   });
 
-  // Map Click Listener - Inspect Any Point
-  map.on('click', async (e) => {
+  map.on('click', (e) => {
     const { lat, lng } = e.latlng;
     inspectCoordinateOnMap(map, lat, lng);
   });
 
-  // Smooth resize invalidation
   setTimeout(() => {
     if (map) map.invalidateSize();
   }, 150);
@@ -1875,15 +1950,18 @@ function inspectCoordinateOnMap(map, lat, lng) {
     fillOpacity: 0.9
   }).addTo(map);
 
+  const safeLat = Number(lat).toFixed(4);
+  const safeLng = Number(lng).toFixed(4);
+
   window.inspectedMarker.bindPopup(`
     <div class="p-1 min-w-[190px]">
       <div class="font-semibold text-xs text-slate-100">Inspected Coordinates</div>
-      <div class="text-[11px] text-slate-400 mt-0.5">${lat.toFixed(4)}°N, ${lng.toFixed(4)}°E</div>
+      <div class="text-[11px] text-slate-400 mt-0.5">${safeLat}°N, ${safeLng}°E</div>
       <div class="text-[11px] text-slate-300 mt-1">
-        Nearest: <strong>${nearest.station.name}</strong> (${nearest.distanceKm} km)
+        Nearest: <strong>${escapeHtml(nearest.station.name)}</strong> (${nearest.distanceKm} km)
       </div>
       <div class="mt-2.5 pt-2 border-t border-slate-800">
-        <button onclick="window.setActiveFromCoordinates(${lat}, ${lng})" class="w-full bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium py-1 px-2 rounded transition">
+        <button type="button" onclick="window.setActiveFromCoordinates(${Number(lat)}, ${Number(lng)})" class="w-full bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-medium py-1 px-2 rounded transition">
           Set as Active Location
         </button>
       </div>
@@ -1903,8 +1981,14 @@ window.setActiveFromCoordinates = async function (lat, lon) {
   state.airQuality = await api.getAirQuality("Custom Location", lat, lon);
   state.currentCity = state.userCoords.locality;
   updateTopHeaderMetrics();
-  alert(`Active location updated to coordinates ${lat.toFixed(3)}°N, ${lon.toFixed(3)}°E.`);
+  showToast(`Active location set to ${lat.toFixed(3)}°N, ${lon.toFixed(3)}°E.`, "success");
   navigateTo('dashboard');
+};
+
+window.selectStationById = async function (stationId) {
+  const matchedStation = ALL_STATIONS.find(s => s.id === stationId);
+  if (!matchedStation) return;
+  await window.selectCityFromMap(matchedStation.name);
 };
 
 window.focusStationOnMap = function (stationId) {
@@ -1924,7 +2008,6 @@ window.setMapFilter = function (filterKey) {
   state.mapFilter = filterKey;
   if (typeof window.updateStationCardsAndMarkers === 'function') {
     window.updateStationCardsAndMarkers();
-    // Update active visual button styling
     document.querySelectorAll('[data-map-filter]').forEach(btn => {
       const k = btn.getAttribute('data-map-filter');
       if (k === filterKey) {
@@ -1956,8 +2039,11 @@ window.selectCityFromMap = async function (cityName) {
     state.nearestStation = { station: matchedStation, distanceKm: 0 };
     state.currentCity = matchedStation.name;
     state.airQuality = await api.getAirQuality(matchedStation.city, matchedStation.lat, matchedStation.lon);
+    state.airQuality.city = matchedStation.name;
+    showToast(`Active station updated to ${matchedStation.name}.`, "success");
   } else {
     state.userCoords = null;
+    state.nearestStation = null;
     state.currentCity = cityName;
     state.airQuality = await api.getAirQuality(cityName);
   }
@@ -1969,7 +2055,8 @@ window.selectCityFromMap = async function (cityName) {
    3. ASSISTANT VIEW (Refined Conversational Interface)
    ========================================================================= */
 function renderAiAssistant(container) {
-  const aq = state.airQuality || { aqi: 350, category: 'Very Poor', city: 'Delhi NCR' };
+  const aq = state.airQuality || { aqi: 350, category: 'Very Poor', city: 'Delhi NCR', color: '#ef4444' };
+  const aqColor = safeHexColor(aq.color, '#ef4444');
 
   container.innerHTML = `
     <div class="mb-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
@@ -1983,7 +2070,7 @@ function renderAiAssistant(container) {
       </div>
 
       <div class="flex items-center gap-2">
-        <button id="btn-clear-chat" class="text-xs text-slate-400 hover:text-white px-3 py-1.5 rounded-lg border border-slate-800 hover:bg-slate-800 transition">
+        <button id="btn-clear-chat" type="button" class="text-xs text-slate-400 hover:text-white px-3 py-1.5 rounded-lg border border-slate-800 hover:bg-slate-800 transition">
           Clear History
         </button>
       </div>
@@ -1993,12 +2080,13 @@ function renderAiAssistant(container) {
     <div class="glass-panel px-4 py-2.5 mb-4 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400">
       <div class="flex items-center gap-2">
         <span class="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
-        <span>Context: <strong class="text-slate-200">${aq.city}</strong></span>
+        <span>Context: <strong class="text-slate-200">${escapeHtml(aq.city)}</strong></span>
         <span>·</span>
-        <span>AQI <strong style="color: ${aq.color}">${aq.aqi}</strong> (${aq.category})</span>
+        <span>AQI <strong style="color: ${aqColor}">${escapeHtml(aq.aqi)}</strong> (${escapeHtml(aq.category)})</span>
       </div>
       <div class="text-[11px] text-slate-500">
-        Household: ${state.profile ? `${state.profile.household_size} members (${state.profile.children_count} kids, ${state.profile.seniors_count} seniors)` : '4 members'}
+        Persona: <strong class="text-slate-300 capitalize">${escapeHtml(state.aiPersona)}</strong> ·
+        Household: ${state.profile ? `${escapeHtml(state.profile.household_size)} members (${escapeHtml(state.profile.children_count)} kids, ${escapeHtml(state.profile.seniors_count)} seniors)` : '4 members'}
       </div>
     </div>
 
@@ -2008,28 +2096,28 @@ function renderAiAssistant(container) {
       <div id="chat-messages" class="flex-1 overflow-y-auto space-y-4 pr-2 mb-4 max-h-[460px]">
         <!-- Welcome Message -->
         <div class="flex items-start gap-3">
-          <div class="w-7 h-7 rounded-md bg-slate-900 border border-slate-700/80 text-emerald-500 flex items-center justify-center font-bold text-xs shrink-0">
-            H
+          <div class="w-7 h-7 rounded-md bg-slate-900 border border-slate-700/80 text-emerald-400 flex items-center justify-center font-bold text-xs shrink-0" aria-hidden="true">
+            V
           </div>
           <div class="chat-bubble-assistant p-4 text-xs md:text-sm text-slate-200 max-w-2xl leading-relaxed">
-            <p><strong>Hello.</strong> I can help you interpret ambient smog indicators, organize low-exposure daily routines, and establish household air filtration practices.</p>
+            <p><strong>Hello.</strong> I am VayuSaathi, your clean-air companion. I can help you interpret ambient smog indicators, organize low-exposure daily routines, and establish household air filtration practices.</p>
             <p class="mt-2 text-slate-400">How can I assist you today?</p>
           </div>
         </div>
 
-        <!-- Render Stored Messages -->
+        <!-- Render Stored Messages (XSS-Safe) -->
         ${state.chatMessages.map(m => `
           <div class="flex items-start gap-3 ${m.role === 'user' ? 'justify-end' : ''}">
             ${m.role !== 'user' ? `
-              <div class="w-7 h-7 rounded-md bg-slate-900 border border-slate-700/80 text-emerald-500 flex items-center justify-center font-bold text-xs shrink-0">
-                H
+              <div class="w-7 h-7 rounded-md bg-slate-900 border border-slate-700/80 text-emerald-400 flex items-center justify-center font-bold text-xs shrink-0" aria-hidden="true">
+                V
               </div>
             ` : ''}
             <div class="${m.role === 'user' ? 'chat-bubble-user p-3 max-w-lg text-xs md:text-sm' : 'chat-bubble-assistant p-4 max-w-2xl text-xs md:text-sm text-slate-200 prose-chat leading-relaxed'}">
               ${formatChatMarkdown(m.content)}
               ${m.role !== 'user' && m.ai_provider ? `
                 <div class="mt-2.5 pt-2 border-t border-slate-800 text-[10px] text-slate-500 flex items-center justify-between">
-                  <span>${m.ai_provider === 'google_gemini_api' ? 'Model: Gemini 2.5 Flash' : 'Environmental Knowledge Engine'}</span>
+                  <span>${m.ai_provider === 'google_gemini_api' ? 'Model: Gemini 2.5 Flash' : escapeHtml(m.ai_provider)}</span>
                   <span>CPCB / WHO Standards</span>
                 </div>
               ` : ''}
@@ -2053,16 +2141,16 @@ function renderAiAssistant(container) {
 
       <!-- Suggested Prompt Chips -->
       <div class="mb-3 flex flex-wrap gap-2">
-        <button class="bg-slate-900 hover:bg-slate-800 text-slate-300 text-xs px-3 py-1.5 rounded-md border border-slate-800 transition" onclick="window.sendPrompt('What precautions should I take during thermal inversion smog?')">
+        <button type="button" class="bg-slate-900 hover:bg-slate-800 text-slate-300 text-xs px-3 py-1.5 rounded-md border border-slate-800 transition" onclick="window.sendPrompt('What precautions should I take during thermal inversion smog?')">
           Precautions during severe smog
         </button>
-        <button class="bg-slate-900 hover:bg-slate-800 text-slate-300 text-xs px-3 py-1.5 rounded-md border border-slate-800 transition" onclick="window.sendPrompt('Is morning outdoor jogging or cycling advisable today?')">
+        <button type="button" class="bg-slate-900 hover:bg-slate-800 text-slate-300 text-xs px-3 py-1.5 rounded-md border border-slate-800 transition" onclick="window.sendPrompt('Is morning outdoor jogging or cycling advisable today?')">
           Morning outdoor exercise advice
         </button>
-        <button class="bg-slate-900 hover:bg-slate-800 text-slate-300 text-xs px-3 py-1.5 rounded-md border border-slate-800 transition" onclick="window.sendPrompt('How can I protect children and elderly family members indoors?')">
+        <button type="button" class="bg-slate-900 hover:bg-slate-800 text-slate-300 text-xs px-3 py-1.5 rounded-md border border-slate-800 transition" onclick="window.sendPrompt('How can I protect children and elderly family members indoors?')">
           Protecting vulnerable household members
         </button>
-        <button class="bg-slate-900 hover:bg-slate-800 text-slate-300 text-xs px-3 py-1.5 rounded-md border border-slate-800 transition" onclick="window.sendPrompt('Suggest a low-emission commuting alternative for my route.')">
+        <button type="button" class="bg-slate-900 hover:bg-slate-800 text-slate-300 text-xs px-3 py-1.5 rounded-md border border-slate-800 transition" onclick="window.sendPrompt('Suggest a low-emission commuting alternative for my route.')">
           Low-emission commute alternatives
         </button>
       </div>
@@ -2072,6 +2160,8 @@ function renderAiAssistant(container) {
         <input 
           type="text" 
           id="chat-input"
+          aria-label="Ask VayuSaathi assistant a question"
+          maxlength="1000"
           class="flex-1 bg-slate-900 border border-slate-700/80 text-slate-200 text-xs md:text-sm rounded-lg px-3.5 py-2.5 focus:outline-none focus:border-slate-500"
           placeholder="Ask a question about air quality, ventilation, or routines..."
           autocomplete="off"
@@ -2107,6 +2197,7 @@ function renderAiAssistant(container) {
     clearBtn.addEventListener('click', async () => {
       await api.clearChatHistory();
       state.chatMessages = [];
+      showToast("Conversation history cleared.", "info");
       renderAiAssistant(container);
     });
   }
@@ -2123,7 +2214,10 @@ async function handleUserChatMessage(text) {
   renderCurrentView();
 
   const typing = document.getElementById('typing-indicator');
-  if (typing) typing.classList.remove('hidden');
+  if (typing) {
+    typing.classList.remove('hidden');
+    typing.classList.add('flex');
+  }
   state.isGeneratingAI = true;
 
   try {
@@ -2133,7 +2227,8 @@ async function handleUserChatMessage(text) {
       aqi: aq.aqi,
       category: aq.category,
       pm2_5: aq.pollutants?.pm2_5?.value || 180.0,
-      temperature_inversion: aq.weather?.temperature_inversion_detected ?? true
+      temperature_inversion: aq.weather?.temperature_inversion_detected ?? true,
+      ai_persona: state.aiPersona
     });
 
     state.chatMessages.push({
@@ -2145,7 +2240,7 @@ async function handleUserChatMessage(text) {
     state.chatMessages.push({
       role: 'assistant',
       content: "Temporary connection error. Please verify network or API settings.",
-      ai_provider: "offline_structured_expert_engine"
+      ai_provider: "VayuSaathi Local Fallback"
     });
   } finally {
     state.isGeneratingAI = false;
@@ -2158,9 +2253,11 @@ function scrollChatToBottom() {
   if (box) box.scrollTop = box.scrollHeight;
 }
 
+// Escape raw HTML BEFORE applying constrained markdown formatting (strict XSS defense)
 function formatChatMarkdown(txt) {
   if (!txt) return '';
-  return txt
+  const safe = escapeHtml(txt);
+  return safe
     .replace(/^### (.*$)/gim, '<h3 class="text-slate-200 font-semibold text-xs mt-3 mb-1">$1</h3>')
     .replace(/\*\*(.*?)\*\*/gim, '<strong>$1</strong>')
     .replace(/\*(.*?)\*/gim, '<em>$1</em>')
@@ -2178,6 +2275,10 @@ function renderFamilyProtection(container) {
     home_ventilation: 'split_ac_windows', has_air_purifier: 0
   };
 
+  const hasAsthma = Number(p.has_asthma_respiratory) === 1;
+  const hasPurifier = Number(p.has_air_purifier) === 1;
+  const generatedPlan = state.familyPlan;
+
   container.innerHTML = `
     <div class="mb-6 flex flex-col md:flex-row md:items-center justify-between gap-4">
       <div>
@@ -2189,7 +2290,7 @@ function renderFamilyProtection(container) {
         </p>
       </div>
 
-      <button id="btn-gen-family-plan" class="bg-slate-800 hover:bg-slate-700 text-white font-medium text-xs px-4 py-2 rounded-lg transition flex items-center gap-1.5">
+      <button id="btn-gen-family-plan" type="button" class="bg-slate-800 hover:bg-slate-700 text-white font-medium text-xs px-4 py-2 rounded-lg transition flex items-center gap-1.5">
         ${icons.sparkles}
         <span>Generate Protection Plan</span>
       </button>
@@ -2213,31 +2314,31 @@ function renderFamilyProtection(container) {
 
         <form id="profile-form" class="space-y-4 text-xs">
           <div>
-            <label class="block text-slate-400 mb-1">Household Members</label>
-            <input type="number" id="p-size" class="w-full bg-slate-900 border border-slate-700/80 rounded-lg p-2 text-slate-200" value="${p.household_size}" min="1" max="15"/>
+            <label for="p-size" class="block text-slate-400 mb-1">Household Members</label>
+            <input type="number" id="p-size" class="w-full bg-slate-900 border border-slate-700/80 rounded-lg p-2 text-slate-200" value="${escapeHtml(p.household_size ?? 4)}" min="1" max="20"/>
           </div>
 
           <div class="grid grid-cols-2 gap-3">
             <div>
-              <label class="block text-slate-400 mb-1">Children (&lt;12)</label>
-              <input type="number" id="p-kids" class="w-full bg-slate-900 border border-slate-700/80 rounded-lg p-2 text-slate-200" value="${p.children_count}" min="0"/>
+              <label for="p-kids" class="block text-slate-400 mb-1">Children (&lt;12)</label>
+              <input type="number" id="p-kids" class="w-full bg-slate-900 border border-slate-700/80 rounded-lg p-2 text-slate-200" value="${escapeHtml(p.children_count ?? 1)}" min="0" max="15"/>
             </div>
             <div>
-              <label class="block text-slate-400 mb-1">Seniors (&gt;60)</label>
-              <input type="number" id="p-seniors" class="w-full bg-slate-900 border border-slate-700/80 rounded-lg p-2 text-slate-200" value="${p.seniors_count}" min="0"/>
+              <label for="p-seniors" class="block text-slate-400 mb-1">Seniors (&gt;60)</label>
+              <input type="number" id="p-seniors" class="w-full bg-slate-900 border border-slate-700/80 rounded-lg p-2 text-slate-200" value="${escapeHtml(p.seniors_count ?? 1)}" min="0" max="15"/>
             </div>
           </div>
 
           <div>
-            <label class="block text-slate-400 mb-1">Respiratory Sensitivity</label>
+            <label for="p-asthma" class="block text-slate-400 mb-1">Respiratory Sensitivity</label>
             <select id="p-asthma" class="w-full bg-slate-900 border border-slate-700/80 rounded-lg p-2 text-slate-200">
-              <option value="1" ${p.has_asthma_respiratory ? 'selected' : ''}>Yes, member has asthma or bronchitis</option>
-              <option value="0" ${!p.has_asthma_respiratory ? 'selected' : ''}>No diagnosed sensitivity</option>
+              <option value="1" ${hasAsthma ? 'selected' : ''}>Yes, member has asthma or bronchitis</option>
+              <option value="0" ${!hasAsthma ? 'selected' : ''}>No diagnosed sensitivity</option>
             </select>
           </div>
 
           <div>
-            <label class="block text-slate-400 mb-1">Primary Commute Mode</label>
+            <label for="p-commute" class="block text-slate-400 mb-1">Primary Commute Mode</label>
             <select id="p-commute" class="w-full bg-slate-900 border border-slate-700/80 rounded-lg p-2 text-slate-200">
               <option value="two_wheeler" ${p.commute_mode === 'two_wheeler' ? 'selected' : ''}>Two-Wheeler</option>
               <option value="petrol_car_solo" ${p.commute_mode === 'petrol_car_solo' ? 'selected' : ''}>Car (Solo)</option>
@@ -2248,15 +2349,15 @@ function renderFamilyProtection(container) {
           </div>
 
           <div>
-            <label class="block text-slate-400 mb-1">Round Trip Distance (km)</label>
-            <input type="number" id="p-dist" class="w-full bg-slate-900 border border-slate-700/80 rounded-lg p-2 text-slate-200" value="${p.daily_commute_km}" min="1" max="150"/>
+            <label for="p-dist" class="block text-slate-400 mb-1">Round Trip Distance (km)</label>
+            <input type="number" id="p-dist" class="w-full bg-slate-900 border border-slate-700/80 rounded-lg p-2 text-slate-200" value="${escapeHtml(p.daily_commute_km ?? 18)}" min="1" max="250"/>
           </div>
 
           <div>
-            <label class="block text-slate-400 mb-1">Air Purifier Available</label>
+            <label for="p-purifier" class="block text-slate-400 mb-1">Air Purifier Available</label>
             <select id="p-purifier" class="w-full bg-slate-900 border border-slate-700/80 rounded-lg p-2 text-slate-200">
-              <option value="1" ${p.has_air_purifier ? 'selected' : ''}>Yes, True HEPA Purifier available</option>
-              <option value="0" ${!p.has_air_purifier ? 'selected' : ''}>No HEPA Purifier in home</option>
+              <option value="1" ${hasPurifier ? 'selected' : ''}>Yes, True HEPA Purifier available</option>
+              <option value="0" ${!hasPurifier ? 'selected' : ''}>No HEPA Purifier in home</option>
             </select>
           </div>
 
@@ -2273,9 +2374,18 @@ function renderFamilyProtection(container) {
             Protection Protocols
           </h2>
           <span class="text-[11px] px-2 py-0.5 rounded border border-slate-700 text-slate-400">
-            ${state.airQuality?.category || 'Very Poor'} Conditions
+            ${escapeHtml(state.airQuality?.category || 'Very Poor')} Conditions
           </span>
         </div>
+
+        ${generatedPlan?.general_recommendations?.length ? `
+          <div class="mb-4 p-3.5 rounded-lg bg-emerald-500/10 border border-emerald-500/30 text-xs">
+            <div class="font-semibold text-emerald-300 mb-1">Tailored Household Summary (${escapeHtml(generatedPlan.city || state.currentCity)})</div>
+            <ul class="list-disc pl-4 space-y-1 text-slate-300">
+              ${generatedPlan.general_recommendations.map(rec => `<li>${escapeHtml(rec)}</li>`).join('')}
+            </ul>
+          </div>
+        ` : ''}
 
         <div class="space-y-3.5">
           <div class="p-4 rounded-lg bg-slate-900/50 border border-slate-800">
@@ -2289,7 +2399,7 @@ function renderFamilyProtection(container) {
 
           <div class="p-4 rounded-lg bg-slate-900/50 border border-slate-800">
             <h3 class="font-semibold text-slate-200 text-xs">
-              Cardiovascular & Senior Protocol (&gt;60 Years)
+              Cardiovascular &amp; Senior Protocol (&gt;60 Years)
             </h3>
             <p class="text-xs text-slate-400 mt-1 leading-relaxed">
               Fine PM2.5 crosses into circulation, contributing to vascular inflammation. Seniors should avoid morning walks prior to 10:00 AM when thermal inversion is most pronounced, and maintain regular hydration.
@@ -2339,17 +2449,17 @@ function renderFamilyProtection(container) {
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
       const updated = {
-        household_size: parseInt(document.getElementById('p-size').value),
-        children_count: parseInt(document.getElementById('p-kids').value),
-        seniors_count: parseInt(document.getElementById('p-seniors').value),
-        has_asthma_respiratory: parseInt(document.getElementById('p-asthma').value),
+        household_size: parseInt(document.getElementById('p-size').value, 10) || 4,
+        children_count: parseInt(document.getElementById('p-kids').value, 10) || 0,
+        seniors_count: parseInt(document.getElementById('p-seniors').value, 10) || 0,
+        has_asthma_respiratory: parseInt(document.getElementById('p-asthma').value, 10) || 0,
         commute_mode: document.getElementById('p-commute').value,
-        daily_commute_km: parseFloat(document.getElementById('p-dist').value),
-        has_air_purifier: parseInt(document.getElementById('p-purifier').value)
+        daily_commute_km: parseFloat(document.getElementById('p-dist').value) || 15.0,
+        has_air_purifier: parseInt(document.getElementById('p-purifier').value, 10) || 0
       };
       await api.saveProfile(updated);
       state.profile = updated;
-      alert("Household profile updated.");
+      showToast("Household profile saved.", "success");
     });
   }
 
@@ -2357,9 +2467,15 @@ function renderFamilyProtection(container) {
   if (genBtn) {
     genBtn.addEventListener('click', async () => {
       genBtn.innerHTML = `<span>Updating...</span>`;
-      await api.generateFamilyPlan(state.currentCity);
-      genBtn.innerHTML = `${icons.sparkles} <span>Generate Protection Plan</span>`;
-      alert("Personalized protection plan generated.");
+      genBtn.disabled = true;
+      try {
+        const res = await api.generateFamilyPlan(state.currentCity);
+        state.familyPlan = res.plan || res;
+        showToast("Personalized protection plan updated.", "success");
+        renderFamilyProtection(container);
+      } finally {
+        genBtn.disabled = false;
+      }
     });
   }
 }
@@ -2473,9 +2589,15 @@ function renderDailyRoutine(container) {
   if (regenBtn) {
     regenBtn.addEventListener('click', async () => {
       regenBtn.innerHTML = `<span>Updating...</span>`;
-      const newRoutine = await api.generateRoutine(state.currentCity, aq.aqi, aq.category);
-      state.currentRoutine = newRoutine;
-      renderDailyRoutine(container);
+      regenBtn.disabled = true;
+      try {
+        const newRoutine = await api.generateRoutine(state.currentCity, aq.aqi, aq.category);
+        state.currentRoutine = newRoutine.routine || newRoutine;
+        showToast("Daily schedule refreshed for current AQI.", "success");
+        renderDailyRoutine(container);
+      } finally {
+        regenBtn.disabled = false;
+      }
     });
   }
 
@@ -2483,25 +2605,34 @@ function renderDailyRoutine(container) {
   if (saveBtn) {
     saveBtn.addEventListener('click', async () => {
       await api.saveRoutine(r);
-      alert("Routine saved to profile.");
+      showToast("Routine saved to your profile.", "success");
     });
   }
+
+  container.querySelectorAll('[data-routine-action]').forEach(cb => {
+    cb.addEventListener('change', (e) => {
+      if (e.target.checked) {
+        window.logRoutineCheck(e.target.getAttribute('data-routine-action'));
+      }
+    });
+  });
 }
 
 function renderRoutineCard(item, idx, prefix) {
+  const safeAction = escapeHtml(item.action);
   return `
     <div class="p-3.5 rounded-lg bg-slate-900/60 border border-slate-800/80 flex flex-col justify-between">
       <div>
         <div class="flex items-center justify-between">
-          <span class="text-xs font-semibold text-slate-300">${item.time}</span>
-          <input type="checkbox" id="${prefix}-${idx}" class="w-3.5 h-3.5 rounded bg-slate-800 border-slate-700 text-emerald-600 focus:ring-0" onchange="window.logRoutineCheck('${item.action}')" />
+          <span class="text-xs font-semibold text-slate-300">${escapeHtml(item.time)}</span>
+          <input type="checkbox" id="${escapeHtml(prefix)}-${idx}" data-routine-action="${safeAction}" aria-label="Mark routine completed: ${safeAction}" class="w-3.5 h-3.5 rounded bg-slate-800 border-slate-700 text-emerald-600 focus:ring-0" />
         </div>
-        <h3 class="text-xs font-semibold text-slate-200 mt-1">${item.action}</h3>
-        <p class="text-xs text-slate-400 mt-1 leading-relaxed">${item.why}</p>
+        <h3 class="text-xs font-semibold text-slate-200 mt-1">${safeAction}</h3>
+        <p class="text-xs text-slate-400 mt-1 leading-relaxed">${escapeHtml(item.why)}</p>
       </div>
       <div class="mt-3 pt-2 border-t border-slate-800/60 text-[11px] space-y-0.5 text-slate-400">
-        <div>Env: <span class="text-slate-300">${item.env_benefit}</span></div>
-        <div>Health: <span class="text-slate-300">${item.personal_benefit}</span></div>
+        <div>Env: <span class="text-slate-300">${escapeHtml(item.env_benefit)}</span></div>
+        <div>Health: <span class="text-slate-300">${escapeHtml(item.personal_benefit)}</span></div>
       </div>
     </div>
   `;
@@ -2516,6 +2647,7 @@ window.logRoutineCheck = async function (actionTitle) {
     pm_saved_g: 0.12,
     points: 15
   });
+  showToast(`Logged: ${actionTitle} (+15 pts)`, "success");
 };
 
 /* =========================================================================
@@ -2525,7 +2657,10 @@ async function renderIndoorAirQuality(container) {
   if (!state.iaqData) {
     state.iaqData = await api.getIaqIntelligence();
   }
-  const data = state.iaqData;
+  const data = state.iaqData || {};
+  const windows = data.ventilation_windows || [];
+  const myths = data.myth_busters || [];
+  const sources = data.combustion_sources || [];
 
   container.innerHTML = `
     <div class="mb-6">
@@ -2543,12 +2678,12 @@ async function renderIndoorAirQuality(container) {
         Ventilation Windows
       </h2>
       <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-        ${data.ventilation_windows.map(w => `
+        ${windows.map(w => `
           <div class="p-4 rounded-lg border border-slate-800 bg-slate-900/50 flex flex-col justify-between">
             <div>
-              <div class="text-xs font-semibold text-slate-300">${w.time_slot}</div>
-              <div class="text-xs font-semibold text-white mt-1">${w.status}</div>
-              <p class="text-xs text-slate-400 mt-2 leading-relaxed">${w.reason}</p>
+              <div class="text-xs font-semibold text-slate-300">${escapeHtml(w.time_slot)}</div>
+              <div class="text-xs font-semibold text-white mt-1">${escapeHtml(w.status)}</div>
+              <p class="text-xs text-slate-400 mt-2 leading-relaxed">${escapeHtml(w.reason)}</p>
             </div>
           </div>
         `).join('')}
@@ -2562,16 +2697,16 @@ async function renderIndoorAirQuality(container) {
           Common Misconceptions
         </h2>
         <div class="space-y-3">
-          ${data.myth_busters.map(m => `
+          ${myths.map(m => `
             <div class="p-3.5 rounded-lg bg-slate-900/50 border border-slate-800">
               <div class="text-xs font-medium text-slate-300">
-                <span class="text-slate-500">Claim:</span> ${m.myth}
+                <span class="text-slate-500">Claim:</span> ${escapeHtml(m.myth)}
               </div>
               <div class="mt-1.5 text-xs text-slate-400 leading-relaxed">
-                <span class="text-slate-500">Finding:</span> ${m.fact}
+                <span class="text-slate-500">Finding:</span> ${escapeHtml(m.fact)}
               </div>
               <div class="mt-2 text-[11px] text-slate-300 bg-slate-900 p-2 rounded border border-slate-800/80">
-                Action: ${m.guidance}
+                Action: ${escapeHtml(m.guidance)}
               </div>
             </div>
           `).join('')}
@@ -2583,15 +2718,15 @@ async function renderIndoorAirQuality(container) {
           Indoor Combustion Sources
         </h2>
         <div class="space-y-3">
-          ${data.combustion_sources.map(c => `
+          ${sources.map(c => `
             <div class="p-3.5 rounded-lg bg-slate-900/50 border border-slate-800 flex flex-col justify-between">
-              <div class="flex items-center justify-between">
-                <span class="text-xs font-medium text-slate-200">${c.source}</span>
-                <span class="text-[10px] px-2 py-0.5 rounded border border-rose-500/20 text-rose-400">${c.pm25_impact}</span>
+              <div class="flex items-center justify-between gap-2">
+                <span class="text-xs font-medium text-slate-200">${escapeHtml(c.source)}</span>
+                <span class="text-[10px] px-2 py-0.5 rounded border border-rose-500/20 text-rose-400 shrink-0">${escapeHtml(c.pm25_impact)}</span>
               </div>
-              <p class="text-xs text-slate-400 mt-1">${c.action}</p>
+              <p class="text-xs text-slate-400 mt-1">${escapeHtml(c.action)}</p>
               <div class="mt-1.5 text-[11px] text-slate-300">
-                Alternative: ${c.substitute}
+                Alternative: ${escapeHtml(c.substitute)}
               </div>
             </div>
           `).join('')}
@@ -2613,14 +2748,14 @@ async function renderIndoorAirQuality(container) {
       <div class="grid grid-cols-1 md:grid-cols-3 gap-6 items-center">
         <div class="space-y-3 text-xs">
           <div>
-            <label class="block text-slate-400 mb-1">Room Area (sq ft)</label>
-            <input type="number" id="cadr-area" class="w-full bg-slate-900 border border-slate-700/80 rounded-lg p-2 text-slate-200" value="220" min="50" max="1500" />
+            <label for="cadr-area" class="block text-slate-400 mb-1">Room Area (sq ft)</label>
+            <input type="number" id="cadr-area" class="w-full bg-slate-900 border border-slate-700/80 rounded-lg p-2 text-slate-200" value="220" min="40" max="2000" />
           </div>
           <div>
-            <label class="block text-slate-400 mb-1">Ceiling Height (ft)</label>
-            <input type="number" id="cadr-height" class="w-full bg-slate-900 border border-slate-700/80 rounded-lg p-2 text-slate-200" value="9" min="7" max="20" />
+            <label for="cadr-height" class="block text-slate-400 mb-1">Ceiling Height (ft)</label>
+            <input type="number" id="cadr-height" class="w-full bg-slate-900 border border-slate-700/80 rounded-lg p-2 text-slate-200" value="9" min="6" max="25" />
           </div>
-          <button id="btn-calc-cadr" class="w-full bg-slate-800 hover:bg-slate-700 text-white font-medium py-2 rounded-lg text-xs transition">
+          <button id="btn-calc-cadr" type="button" class="w-full bg-slate-800 hover:bg-slate-700 text-white font-medium py-2 rounded-lg text-xs transition">
             Calculate CADR
           </button>
         </div>
@@ -2639,8 +2774,8 @@ async function renderIndoorAirQuality(container) {
   const calcBtn = document.getElementById('btn-calc-cadr');
   if (calcBtn) {
     calcBtn.addEventListener('click', () => {
-      const area = parseFloat(document.getElementById('cadr-area').value) || 200;
-      const height = parseFloat(document.getElementById('cadr-height').value) || 9;
+      const area = Math.max(40, Math.min(2000, parseFloat(document.getElementById('cadr-area').value) || 220));
+      const height = Math.max(6, Math.min(25, parseFloat(document.getElementById('cadr-height').value) || 9));
       const volumeM3 = (area * height) * 0.0283168;
       const requiredCADR = Math.round(volumeM3 * 5);
       const cfm = Math.round(requiredCADR / 1.7);
@@ -2664,12 +2799,14 @@ async function renderIndoorAirQuality(container) {
    ========================================================================= */
 async function renderAlternatives(container) {
   const comp = await api.compareAlternatives(state.tripDistanceKm);
+  const comparisons = comp.comparisons || [];
+  const baseline = comp.baseline || { co2_emitted_kg: 0, pm25_emitted_g: 0 };
 
   container.innerHTML = `
     <div class="mb-6 flex flex-col md:flex-row md:items-center justify-between gap-4">
       <div>
         <h1 class="text-xl md:text-2xl font-semibold tracking-tight text-white">
-          Clean Transit & Habits
+          Clean Transit &amp; Habits
         </h1>
         <p class="text-xs text-slate-400 mt-0.5">
           Quantified emissions comparison across urban commute modes and household choices.
@@ -2677,17 +2814,17 @@ async function renderAlternatives(container) {
       </div>
 
       <div class="flex items-center gap-3 glass-panel px-3.5 py-1.5 text-xs">
-        <label class="text-slate-400">Distance:</label>
+        <label for="trip-slider" class="text-slate-400">Distance:</label>
         <input 
           type="range" 
           id="trip-slider" 
           min="5" 
           max="50" 
           step="5" 
-          value="${state.tripDistanceKm}"
+          value="${escapeHtml(state.tripDistanceKm)}"
           class="w-24 sm:w-32 accent-slate-400"
         />
-        <span id="trip-val" class="font-semibold text-slate-200 min-w-[45px]">${state.tripDistanceKm} km</span>
+        <span id="trip-val" class="font-semibold text-slate-200 min-w-[45px]">${escapeHtml(state.tripDistanceKm)} km</span>
       </div>
     </div>
 
@@ -2697,7 +2834,7 @@ async function renderAlternatives(container) {
       <div>
         <div class="font-medium text-slate-300">Baseline Reference: Single-Occupancy Petrol Vehicle (1.2L BS-VI)</div>
         <p class="text-slate-400 mt-0.5">
-          A ${state.tripDistanceKm} km round trip emits <strong>${comp.baseline.co2_emitted_kg} kg CO2</strong> and <strong>${comp.baseline.pm25_emitted_g} g PM2.5</strong> into the urban canopy.
+          A ${escapeHtml(state.tripDistanceKm)} km round trip emits <strong>${escapeHtml(baseline.co2_emitted_kg)} kg CO2</strong> and <strong>${escapeHtml(baseline.pm25_emitted_g)} g PM2.5</strong> into the urban canopy.
         </p>
       </div>
     </div>
@@ -2705,7 +2842,7 @@ async function renderAlternatives(container) {
     <!-- Comparative Table -->
     <div class="glass-panel p-5 mb-6 overflow-x-auto">
       <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-300 mb-4">
-        Transport Modes (${state.tripDistanceKm} km Commute)
+        Transport Modes (${escapeHtml(state.tripDistanceKm)} km Commute)
       </h2>
       <table class="w-full text-left text-xs text-slate-300 min-w-[560px]">
         <thead>
@@ -2719,16 +2856,16 @@ async function renderAlternatives(container) {
           </tr>
         </thead>
         <tbody class="divide-y divide-slate-800/80">
-          ${comp.comparisons.map(c => `
+          ${comparisons.map(c => `
             <tr class="hover:bg-slate-900/40 transition">
-              <td class="py-2.5 font-medium text-slate-200">${c.name}</td>
-              <td class="py-2.5 text-slate-400">${c.co2_emitted_kg} kg</td>
-              <td class="py-2.5 text-slate-400">${c.pm25_emitted_g} g</td>
-              <td class="py-2.5 text-emerald-400 font-medium">${c.co2_saved_kg > 0 ? `+${c.co2_saved_kg} kg` : '0 kg'}</td>
-              <td class="py-2.5 text-cyan-400 font-medium">${c.pm25_saved_g > 0 ? `+${c.pm25_saved_g} g` : '0 g'}</td>
+              <td class="py-2.5 font-medium text-slate-200">${escapeHtml(c.name)}</td>
+              <td class="py-2.5 text-slate-400">${escapeHtml(c.co2_emitted_kg)} kg</td>
+              <td class="py-2.5 text-slate-400">${escapeHtml(c.pm25_emitted_g)} g</td>
+              <td class="py-2.5 text-emerald-400 font-medium">${c.co2_saved_kg > 0 ? `+${escapeHtml(c.co2_saved_kg)} kg` : '0 kg'}</td>
+              <td class="py-2.5 text-cyan-400 font-medium">${c.pm25_saved_g > 0 ? `+${escapeHtml(c.pm25_saved_g)} g` : '0 g'}</td>
               <td class="py-2.5">
                 <span class="px-2 py-0.5 rounded text-[10px] font-medium ${c.reduction_percentage > 70 ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-500/20' : 'bg-slate-800 text-slate-400'}">
-                  ${c.reduction_percentage}%
+                  ${escapeHtml(c.reduction_percentage)}%
                 </span>
               </td>
             </tr>
@@ -2736,7 +2873,7 @@ async function renderAlternatives(container) {
         </tbody>
       </table>
       <div class="mt-3 text-[11px] text-slate-500">
-        ${comp.methodology}
+        ${escapeHtml(comp.methodology || '')}
       </div>
     </div>
 
@@ -2802,6 +2939,9 @@ async function renderAlternatives(container) {
    ========================================================================= */
 async function renderCommunityHub(container) {
   const hub = await api.getCommunityHub();
+  const stats = hub.community_stats || { active_members: 2350, total_community_co2_saved_kg: 1432.6, total_community_pm_saved_g: 429, verified_reports_resolved: 38 };
+  const campaigns = hub.campaigns || [];
+  const reports = hub.reports || [];
 
   container.innerHTML = `
     <div class="mb-6 flex flex-col md:flex-row md:items-center justify-between gap-4">
@@ -2814,7 +2954,7 @@ async function renderCommunityHub(container) {
         </p>
       </div>
 
-      <button id="btn-open-report" class="bg-rose-600 hover:bg-rose-500 text-white font-medium text-xs px-3.5 py-2 rounded-lg transition flex items-center gap-1.5">
+      <button id="btn-open-report" type="button" class="bg-rose-600 hover:bg-rose-500 text-white font-medium text-xs px-3.5 py-2 rounded-lg transition flex items-center gap-1.5">
         ${icons.plus}
         <span>Report Concern</span>
       </button>
@@ -2824,19 +2964,19 @@ async function renderCommunityHub(container) {
     <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
       <div class="glass-panel p-4">
         <div class="text-[11px] text-slate-500 uppercase tracking-wider font-medium">Active Citizens</div>
-        <div class="text-2xl font-bold tracking-tight text-slate-100 mt-1">${hub.community_stats.active_members}</div>
+        <div class="text-2xl font-bold tracking-tight text-slate-100 mt-1">${escapeHtml(stats.active_members)}</div>
       </div>
       <div class="glass-panel p-4">
         <div class="text-[11px] text-slate-500 uppercase tracking-wider font-medium">Collective CO2 Saved</div>
-        <div class="text-2xl font-bold tracking-tight text-emerald-400 mt-1">${hub.community_stats.total_community_co2_saved_kg} kg</div>
+        <div class="text-2xl font-bold tracking-tight text-emerald-400 mt-1">${escapeHtml(stats.total_community_co2_saved_kg)} kg</div>
       </div>
       <div class="glass-panel p-4">
         <div class="text-[11px] text-slate-500 uppercase tracking-wider font-medium">PM2.5 Averted</div>
-        <div class="text-2xl font-bold tracking-tight text-cyan-400 mt-1">${hub.community_stats.total_community_pm_saved_g} g</div>
+        <div class="text-2xl font-bold tracking-tight text-cyan-400 mt-1">${escapeHtml(stats.total_community_pm_saved_g)} g</div>
       </div>
       <div class="glass-panel p-4">
         <div class="text-[11px] text-slate-500 uppercase tracking-wider font-medium">Reports Addressed</div>
-        <div class="text-2xl font-bold tracking-tight text-slate-100 mt-1">${hub.community_stats.verified_reports_resolved}</div>
+        <div class="text-2xl font-bold tracking-tight text-slate-100 mt-1">${escapeHtml(stats.verified_reports_resolved)}</div>
       </div>
     </div>
 
@@ -2846,20 +2986,20 @@ async function renderCommunityHub(container) {
         Active Campaigns
       </h2>
       <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-        ${hub.campaigns.map(c => `
+        ${campaigns.map(c => `
           <div class="p-4 rounded-lg bg-slate-900/50 border border-slate-800 flex flex-col justify-between">
             <div>
-              <div class="text-xs font-semibold text-slate-200">${c.title}</div>
-              <p class="text-xs text-slate-400 mt-1 leading-relaxed">${c.goal}</p>
-              <div class="text-[11px] text-slate-300 mt-2 font-medium">Target: ${c.impact_milestone}</div>
+              <div class="text-xs font-semibold text-slate-200">${escapeHtml(c.title)}</div>
+              <p class="text-xs text-slate-400 mt-1 leading-relaxed">${escapeHtml(c.goal)}</p>
+              <div class="text-[11px] text-slate-300 mt-2 font-medium">Target: ${escapeHtml(c.impact_milestone)}</div>
             </div>
             <div class="mt-4 pt-2 border-t border-slate-800/80">
               <div class="flex justify-between text-[10px] text-slate-500 mb-1">
-                <span>${c.participants} joined</span>
-                <span class="font-medium text-slate-300">${c.progress_pct}%</span>
+                <span>${escapeHtml(c.participants)} joined</span>
+                <span class="font-medium text-slate-300">${escapeHtml(c.progress_pct)}%</span>
               </div>
               <div class="w-full bg-slate-800 rounded-full h-1 overflow-hidden">
-                <div class="bg-slate-300 h-1 rounded-full" style="width: ${c.progress_pct}%"></div>
+                <div class="bg-slate-300 h-1 rounded-full" style="width: ${Math.min(100, Math.max(0, Number(c.progress_pct) || 0))}%"></div>
               </div>
             </div>
           </div>
@@ -2867,7 +3007,7 @@ async function renderCommunityHub(container) {
       </div>
     </div>
 
-    <!-- Incident Reports List -->
+    <!-- Incident Reports List (XSS-Sanitized) -->
     <div class="glass-panel p-5">
       <div class="flex items-center justify-between mb-4">
         <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-300">
@@ -2877,39 +3017,43 @@ async function renderCommunityHub(container) {
       </div>
 
       <div class="space-y-3">
-        ${hub.reports.map(r => `
-          <div class="p-3.5 rounded-lg bg-slate-900/50 border border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-            <div>
-              <div class="flex items-center gap-2">
-                <span class="text-xs font-semibold text-slate-200">${r.title}</span>
-                <span class="text-[10px] px-1.5 py-0.2 rounded font-medium uppercase ${r.severity === 'critical' ? 'border border-rose-500/30 text-rose-400 bg-rose-500/10' : 'border border-amber-500/30 text-amber-400 bg-amber-500/10'}">
-                  ${r.severity}
-                </span>
-                <span class="text-[10px] px-1.5 py-0.2 rounded border border-slate-800 text-slate-500">
-                  ${r.status}
-                </span>
+        ${reports.map(r => {
+          const sev = String(r.severity || 'medium');
+          const sevCls = sev === 'critical'
+            ? 'border border-rose-500/30 text-rose-400 bg-rose-500/10'
+            : 'border border-amber-500/30 text-amber-400 bg-amber-500/10';
+          return `
+            <div class="p-3.5 rounded-lg bg-slate-900/50 border border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div>
+                <div class="flex items-center gap-2 flex-wrap">
+                  <span class="text-xs font-semibold text-slate-200">${escapeHtml(r.title)}</span>
+                  <span class="text-[10px] px-1.5 py-0.2 rounded font-medium uppercase ${sevCls}">
+                    ${escapeHtml(sev)}
+                  </span>
+                  <span class="text-[10px] px-1.5 py-0.2 rounded border border-slate-800 text-slate-500">
+                    ${escapeHtml(r.status || 'Under Review')}
+                  </span>
+                </div>
+                <p class="text-xs text-slate-400 mt-1">${escapeHtml(r.description)}</p>
+                <div class="text-[11px] text-slate-500 mt-1">Location: ${escapeHtml(r.location_name)} · ${safeDateLabel(r.created_at || r.timestamp)}</div>
               </div>
-              <p class="text-xs text-slate-400 mt-1">${r.description}</p>
-              <div class="text-[11px] text-slate-500 mt-1">Location: ${r.location_name} · ${new Date(r.created_at).toLocaleDateString()}</div>
-            </div>
 
-            <div class="flex items-center gap-2 shrink-0">
-              <button class="bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white text-xs px-2.5 py-1 rounded-md flex items-center gap-1 transition" onclick="window.upvoteReport(${r.id})">
-                ${icons.thumbsUp}
-                <span>${r.upvotes}</span>
-              </button>
+              <div class="flex items-center gap-2 shrink-0">
+                <button type="button" aria-label="Upvote report" class="bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white text-xs px-2.5 py-1 rounded-md flex items-center gap-1 transition" onclick="window.upvoteReport('${escapeHtml(String(r.id))}')">
+                  ${icons.thumbsUp}
+                  <span>${escapeHtml(r.upvotes ?? 1)}</span>
+                </button>
+              </div>
             </div>
-          </div>
-        `).join('')}
+          `;
+        }).join('')}
       </div>
     </div>
   `;
 
   const reportBtn = document.getElementById('btn-open-report');
   if (reportBtn) {
-    reportBtn.addEventListener('click', () => {
-      openReportModal();
-    });
+    reportBtn.addEventListener('click', () => openReportModal());
   }
 }
 
@@ -2928,6 +3072,9 @@ function openReportModal() {
    ========================================================================= */
 async function renderImpactTracker(container) {
   const stats = await api.getImpactStats();
+  const eq = stats.equivalent_metrics || { car_kilometers_avoided: 0, clean_air_breathing_hours: 0, trees_planted_equivalent: 0 };
+  const recent = stats.recent_actions || [];
+  const score = Math.min(100, Math.max(0, Number(stats.sustainability_score) || 78));
 
   container.innerHTML = `
     <div class="mb-6 flex flex-col md:flex-row md:items-center justify-between gap-4">
@@ -2940,7 +3087,7 @@ async function renderImpactTracker(container) {
         </p>
       </div>
 
-      <button id="btn-log-action" class="bg-emerald-600 hover:bg-emerald-500 text-white font-medium text-xs px-3.5 py-2 rounded-lg transition flex items-center gap-1.5">
+      <button id="btn-log-action" type="button" class="bg-emerald-600 hover:bg-emerald-500 text-white font-medium text-xs px-3.5 py-2 rounded-lg transition flex items-center gap-1.5">
         ${icons.plus}
         <span>Log Action</span>
       </button>
@@ -2951,18 +3098,18 @@ async function renderImpactTracker(container) {
       <div class="glass-panel p-5 flex flex-col items-center justify-center text-center">
         <span class="text-[11px] font-semibold uppercase tracking-wider text-slate-400">Sustainability Score</span>
         <div class="relative w-28 h-28 my-3 flex items-center justify-center">
-          <svg class="w-full h-full transform -rotate-90">
+          <svg class="w-full h-full transform -rotate-90" aria-hidden="true">
             <circle cx="56" cy="56" r="44" stroke="rgba(255, 255, 255, 0.08)" stroke-width="8" fill="transparent" />
-            <circle cx="56" cy="56" r="44" stroke="#10b981" stroke-width="8" stroke-linecap="round" fill="transparent" stroke-dasharray="276" stroke-dashoffset="${276 - (276 * stats.sustainability_score / 100)}" class="score-circle" />
+            <circle cx="56" cy="56" r="44" stroke="#10b981" stroke-width="8" stroke-linecap="round" fill="transparent" stroke-dasharray="276" stroke-dashoffset="${276 - (276 * score / 100)}" class="score-circle" />
           </svg>
           <div class="absolute flex flex-col items-center">
-            <span class="text-2xl font-bold text-white tracking-tight">${stats.sustainability_score}</span>
+            <span class="text-2xl font-bold text-white tracking-tight">${escapeHtml(score)}</span>
             <span class="text-[9px] text-slate-500 uppercase font-medium">/ 100</span>
           </div>
         </div>
-        <div class="text-xs font-semibold text-emerald-400">${stats.score_tier}</div>
+        <div class="text-xs font-semibold text-emerald-400">${escapeHtml(stats.score_tier || 'Clean Air Champion')}</div>
         <p class="text-[11px] text-slate-500 mt-1 leading-relaxed">
-          ${stats.score_explanation}
+          ${escapeHtml(stats.score_explanation || '')}
         </p>
       </div>
 
@@ -2970,25 +3117,25 @@ async function renderImpactTracker(container) {
         <div class="grid grid-cols-1 sm:grid-cols-3 gap-4 mb-4">
           <div class="p-3.5 rounded-lg bg-slate-900/50 border border-slate-800">
             <span class="text-[11px] text-slate-500 uppercase tracking-wider">CO2 Avoided</span>
-            <div class="text-2xl font-bold tracking-tight text-emerald-400 mt-1">${stats.total_co2_saved_kg} kg</div>
-            <span class="text-[11px] text-slate-500">~${stats.equivalent_metrics.car_kilometers_avoided} km vehicle travel offset</span>
+            <div class="text-2xl font-bold tracking-tight text-emerald-400 mt-1">${escapeHtml(stats.total_co2_saved_kg)} kg</div>
+            <span class="text-[11px] text-slate-500">~${escapeHtml(eq.car_kilometers_avoided)} km vehicle travel offset</span>
           </div>
 
           <div class="p-3.5 rounded-lg bg-slate-900/50 border border-slate-800">
             <span class="text-[11px] text-slate-500 uppercase tracking-wider">PM2.5 Averted</span>
-            <div class="text-2xl font-bold tracking-tight text-cyan-400 mt-1">${stats.total_pm_saved_g} g</div>
-            <span class="text-[11px] text-slate-500">~${stats.equivalent_metrics.clean_air_breathing_hours} hours clean air equivalent</span>
+            <div class="text-2xl font-bold tracking-tight text-cyan-400 mt-1">${escapeHtml(stats.total_pm_saved_g)} g</div>
+            <span class="text-[11px] text-slate-500">~${escapeHtml(eq.clean_air_breathing_hours)} hours clean air equivalent</span>
           </div>
 
           <div class="p-3.5 rounded-lg bg-slate-900/50 border border-slate-800">
             <span class="text-[11px] text-slate-500 uppercase tracking-wider">Tree Absorption</span>
-            <div class="text-2xl font-bold tracking-tight text-slate-200 mt-1">${stats.equivalent_metrics.trees_planted_equivalent}</div>
+            <div class="text-2xl font-bold tracking-tight text-slate-200 mt-1">${escapeHtml(eq.trees_planted_equivalent)}</div>
             <span class="text-[11px] text-slate-500">Annual sequestration equivalent</span>
           </div>
         </div>
 
         <div class="p-3 rounded-lg bg-slate-900/40 border border-slate-800/80 text-[11px] text-slate-400">
-          Methodology: ${stats.methodology}
+          Methodology: ${escapeHtml(stats.methodology || '')}
         </div>
       </div>
     </div>
@@ -3002,7 +3149,7 @@ async function renderImpactTracker(container) {
         <span class="text-[11px] text-slate-500">7-Day Avoided Emissions</span>
       </div>
       <div class="relative h-56 w-full">
-        <canvas id="impactChart"></canvas>
+        <canvas id="impactChart" aria-label="Weekly avoided CO2 and PM2.5 chart"></canvas>
       </div>
     </div>
 
@@ -3012,16 +3159,16 @@ async function renderImpactTracker(container) {
         Recent Activity
       </h2>
       <div class="space-y-3">
-        ${stats.recent_actions.map(a => `
-          <div class="p-3 rounded-lg bg-slate-900/50 border border-slate-800 flex items-center justify-between">
+        ${recent.map(a => `
+          <div class="p-3 rounded-lg bg-slate-900/50 border border-slate-800 flex items-center justify-between gap-3">
             <div>
-              <div class="text-xs font-medium text-slate-200">${a.title}</div>
-              <p class="text-xs text-slate-400 mt-0.5">${a.description}</p>
-              <div class="text-[10px] text-slate-500 mt-1">${new Date(a.completed_at).toLocaleDateString()}</div>
+              <div class="text-xs font-medium text-slate-200">${escapeHtml(a.title)}</div>
+              <p class="text-xs text-slate-400 mt-0.5">${escapeHtml(a.description)}</p>
+              <div class="text-[10px] text-slate-500 mt-1">${safeDateLabel(a.completed_at || a.timestamp)}</div>
             </div>
-            <div class="text-right">
-              <span class="text-xs font-medium text-emerald-400">+${a.co2_saved_kg} kg CO2</span>
-              <div class="text-[11px] text-cyan-400">+${a.pm_saved_g} g PM2.5</div>
+            <div class="text-right shrink-0">
+              <span class="text-xs font-medium text-emerald-400">+${escapeHtml(a.co2_saved_kg)} kg CO2</span>
+              <div class="text-[11px] text-cyan-400">+${escapeHtml(a.pm_saved_g)} g PM2.5</div>
             </div>
           </div>
         `).join('')}
@@ -3030,13 +3177,9 @@ async function renderImpactTracker(container) {
   `;
 
   const logBtn = document.getElementById('btn-log-action');
-  if (logBtn) {
-    logBtn.addEventListener('click', () => {
-      openActionModal();
-    });
-  }
+  if (logBtn) logBtn.addEventListener('click', () => openActionModal());
 
-  initImpactChart(stats.weekly_trend);
+  initImpactChart(stats.weekly_trend || []);
 }
 
 function initImpactChart(weekly) {
@@ -3054,13 +3197,13 @@ function initImpactChart(weekly) {
       datasets: [
         {
           label: 'CO2 Avoided (kg)',
-          data: weekly.map(w => w.co2_saved_kg),
+          data: weekly.map(w => w.co2_saved_kg || 0),
           backgroundColor: '#10b981',
           borderRadius: 4
         },
         {
           label: 'PM2.5 Avoided (g)',
-          data: weekly.map(w => w.pm_saved_g),
+          data: weekly.map(w => w.pm_saved_g || 0),
           backgroundColor: '#38bdf8',
           borderRadius: 4
         }
@@ -3096,7 +3239,7 @@ async function renderAlertsCenter(container) {
     <div class="mb-6 flex flex-col md:flex-row md:items-center justify-between gap-4">
       <div>
         <h1 class="text-xl md:text-2xl font-semibold tracking-tight text-white">
-          Alerts & Notifications
+          Alerts &amp; Notifications
         </h1>
         <p class="text-xs text-slate-400 mt-0.5">
           Real-time smog warnings, daylight ventilation windows, and community notifications.
@@ -3104,7 +3247,7 @@ async function renderAlertsCenter(container) {
       </div>
 
       <div class="flex items-center gap-2">
-        <button id="btn-mark-all-read" class="bg-slate-900 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-700/80 text-xs px-3 py-1.5 rounded-lg transition">
+        <button id="btn-mark-all-read" type="button" class="bg-slate-900 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-700/80 text-xs px-3 py-1.5 rounded-lg transition">
           Mark All Read
         </button>
       </div>
@@ -3116,13 +3259,13 @@ async function renderAlertsCenter(container) {
         Simulation Triggers:
       </div>
       <div class="flex flex-wrap gap-2">
-        <button class="bg-slate-900 hover:bg-slate-800 text-rose-300 border border-slate-700 text-xs px-2.5 py-1 rounded-md transition" onclick="window.triggerSimAlert('smog_spike')">
+        <button type="button" class="bg-slate-900 hover:bg-slate-800 text-rose-300 border border-slate-700 text-xs px-2.5 py-1 rounded-md transition" onclick="window.triggerSimAlert('smog_spike')">
           Inversion Smog Spike
         </button>
-        <button class="bg-slate-900 hover:bg-slate-800 text-emerald-300 border border-slate-700 text-xs px-2.5 py-1 rounded-md transition" onclick="window.triggerSimAlert('ventilation')">
+        <button type="button" class="bg-slate-900 hover:bg-slate-800 text-emerald-300 border border-slate-700 text-xs px-2.5 py-1 rounded-md transition" onclick="window.triggerSimAlert('ventilation')">
           Ventilation Window
         </button>
-        <button class="bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-700 text-xs px-2.5 py-1 rounded-md transition" onclick="window.triggerSimAlert('achievement')">
+        <button type="button" class="bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-700 text-xs px-2.5 py-1 rounded-md transition" onclick="window.triggerSimAlert('achievement')">
           Milestone Notification
         </button>
       </div>
@@ -3133,26 +3276,32 @@ async function renderAlertsCenter(container) {
       <div class="space-y-3">
         ${state.alerts.length === 0 ? `
           <div class="p-8 text-center text-slate-500 text-xs">No active alerts at this moment.</div>
-        ` : state.alerts.map(a => `
-          <div class="p-3.5 rounded-lg border flex items-start justify-between gap-3 ${a.is_read ? 'bg-slate-900/30 border-slate-800/60 opacity-70' : 'bg-slate-900/70 border-slate-800'}">
-            <div class="flex items-start gap-3">
-              <span class="w-2 h-2 rounded-full mt-1.5 shrink-0 ${a.severity === 'danger' ? 'bg-rose-500' : (a.severity === 'success' ? 'bg-emerald-500' : 'bg-cyan-500')}"></span>
-              <div>
-                <div class="text-xs font-semibold text-slate-200 flex items-center gap-2">
-                  <span>${a.title}</span>
-                  ${!a.is_read ? '<span class="w-1.5 h-1.5 rounded-full bg-cyan-400"></span>' : ''}
+        ` : state.alerts.map(a => {
+          const sev = a.severity || a.level || 'info';
+          const dotColor = sev === 'danger' || sev === 'severe'
+            ? 'bg-rose-500'
+            : (sev === 'success' ? 'bg-emerald-500' : 'bg-cyan-500');
+          return `
+            <div class="p-3.5 rounded-lg border flex items-start justify-between gap-3 ${a.is_read ? 'bg-slate-900/30 border-slate-800/60 opacity-70' : 'bg-slate-900/70 border-slate-800'}">
+              <div class="flex items-start gap-3">
+                <span class="w-2 h-2 rounded-full mt-1.5 shrink-0 ${dotColor}"></span>
+                <div>
+                  <div class="text-xs font-semibold text-slate-200 flex items-center gap-2">
+                    <span>${escapeHtml(a.title)}</span>
+                    ${!a.is_read ? '<span class="w-1.5 h-1.5 rounded-full bg-cyan-400"></span>' : ''}
+                  </div>
+                  <p class="text-xs text-slate-400 mt-1 leading-relaxed">${escapeHtml(a.message)}</p>
+                  <span class="text-[10px] text-slate-500 mt-2 block">${safeDateLabel(a.created_at || a.issued_at, true)}</span>
                 </div>
-                <p class="text-xs text-slate-400 mt-1 leading-relaxed">${a.message}</p>
-                <span class="text-[10px] text-slate-500 mt-2 block">${new Date(a.created_at).toLocaleString()}</span>
               </div>
+              ${!a.is_read ? `
+                <button type="button" class="text-xs text-slate-400 hover:text-white shrink-0 font-medium" onclick="window.markSingleAlertRead('${escapeHtml(String(a.id))}')">
+                  Dismiss
+                </button>
+              ` : ''}
             </div>
-            ${!a.is_read ? `
-              <button class="text-xs text-slate-400 hover:text-white shrink-0 font-medium" onclick="window.markSingleAlertRead(${a.id})">
-                Dismiss
-              </button>
-            ` : ''}
-          </div>
-        `).join('')}
+          `;
+        }).join('')}
       </div>
     </div>
   `;
@@ -3163,6 +3312,7 @@ async function renderAlertsCenter(container) {
       await api.markAlertsRead();
       state.alerts.forEach(a => a.is_read = 1);
       updateTopHeaderMetrics();
+      showToast("All bulletins marked as read.", "info");
       renderAlertsCenter(container);
     });
   }
@@ -3171,15 +3321,16 @@ async function renderAlertsCenter(container) {
 window.triggerSimAlert = async function (scenario) {
   await api.triggerDemoAlert(scenario);
   const updated = await api.getAlerts();
-  state.alerts = updated.alerts;
+  state.alerts = updated.alerts || [];
   updateTopHeaderMetrics();
+  showToast("Simulated bulletin added.", "info");
   renderCurrentView();
 };
 
 window.markSingleAlertRead = async function (id) {
   await api.markAlertsRead(id);
   const updated = await api.getAlerts();
-  state.alerts = updated.alerts;
+  state.alerts = updated.alerts || [];
   updateTopHeaderMetrics();
   renderCurrentView();
 };
@@ -3207,7 +3358,7 @@ async function renderSettings(container) {
       </div>
 
       <div class="flex items-center gap-2">
-        <button onclick="window.vayusaathiNavigate ? window.vayusaathiNavigate('map') : window.hawawiseNavigate('map')" class="text-xs bg-slate-900 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-700/80 px-3.5 py-2 rounded-lg transition flex items-center gap-1.5">
+        <button type="button" onclick="window.vayusaathiNavigate('map')" class="text-xs bg-slate-900 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-700/80 px-3.5 py-2 rounded-lg transition flex items-center gap-1.5">
           ${icons.map}
           <span>Go to Map</span>
         </button>
@@ -3235,15 +3386,15 @@ async function renderSettings(container) {
               <span>No API Key Required Out-of-the-Box</span>
             </div>
             <p class="text-[11px] text-slate-400">
-              Google Maps Roadmap, Satellite, Hybrid, Terrain & Traffic tiles load automatically with zero setup. Entering your own Google Cloud key is 100% optional for high-volume enterprise quotas.
+              Google Maps Roadmap, Satellite, Hybrid, Terrain &amp; Traffic tiles load automatically with zero setup. Entering your own Google Cloud key is 100% optional for high-volume enterprise quotas.
             </p>
           </div>
 
           <form id="gmaps-key-form" class="space-y-4">
             <div>
               <div class="flex items-center justify-between mb-1">
-                <label class="block text-xs text-slate-400 font-medium">Google Maps API Key (Optional)</label>
-                <a href="https://console.cloud.google.com/google/maps-apis/overview" target="_blank" rel="noopener" class="text-[11px] text-cyan-400 hover:underline">
+                <label for="gmaps-key-input" class="block text-xs text-slate-400 font-medium">Google Maps API Key (Optional)</label>
+                <a href="https://console.cloud.google.com/google/maps-apis/overview" target="_blank" rel="noopener noreferrer" class="text-[11px] text-cyan-400 hover:underline">
                   Get Free Key from Google Cloud ↗
                 </a>
               </div>
@@ -3251,7 +3402,8 @@ async function renderSettings(container) {
                 <input 
                   type="password" 
                   id="gmaps-key-input" 
-                  value="${gmapsKey}"
+                  value="${escapeHtml(gmapsKey)}"
+                  maxlength="256"
                   class="w-full bg-slate-900 border border-slate-700/80 rounded-lg pl-3 pr-20 py-2 text-slate-200 text-xs font-mono focus:outline-none focus:border-slate-500"
                   placeholder="AIzaSy... (optional for custom quota)"
                 />
@@ -3279,7 +3431,7 @@ async function renderSettings(container) {
                 </button>
                 <button type="button" class="px-2.5 py-1.5 rounded-lg border text-left transition ${state.mapLayer === 'google_terrain' ? 'bg-slate-800 text-white border-blue-500' : 'bg-slate-900/60 text-slate-400 border-slate-800 hover:border-slate-700'}" onclick="window.switchMapLayer('google_terrain')">
                   <div class="font-medium text-slate-200">Terrain</div>
-                  <div class="text-[10px] text-slate-500">Topography & Relief</div>
+                  <div class="text-[10px] text-slate-500">Topography &amp; Relief</div>
                 </button>
                 <button type="button" class="px-2.5 py-1.5 rounded-lg border text-left transition ${state.mapLayer === 'google_traffic' ? 'bg-slate-800 text-white border-blue-500' : 'bg-slate-900/60 text-slate-400 border-slate-800 hover:border-slate-700'}" onclick="window.switchMapLayer('google_traffic')">
                   <div class="font-medium text-slate-200">Traffic</div>
@@ -3294,7 +3446,7 @@ async function renderSettings(container) {
 
             <!-- Default Map Zoom -->
             <div>
-              <label class="block text-xs text-slate-400 mb-1 font-medium">Default Map Zoom</label>
+              <label for="map-zoom-select" class="block text-xs text-slate-400 mb-1 font-medium">Default Map Zoom</label>
               <select id="map-zoom-select" class="w-full bg-slate-900 border border-slate-700/80 rounded-lg p-2 text-slate-200 text-xs focus:outline-none">
                 <option value="12" ${state.mapZoomLevel === 12 ? 'selected' : ''}>Neighborhood View (12x - High Local Detail)</option>
                 <option value="11" ${state.mapZoomLevel === 11 ? 'selected' : ''}>Metropolitan View (11x - Recommended)</option>
@@ -3337,16 +3489,17 @@ async function renderSettings(container) {
           <form id="key-form" class="space-y-4">
             <div>
               <div class="flex items-center justify-between mb-1">
-                <label class="block text-xs text-slate-400 font-medium">Gemini API Key</label>
-                <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener" class="text-[11px] text-cyan-400 hover:underline">
+                <label for="gemini-key-input" class="block text-xs text-slate-400 font-medium">Gemini API Key</label>
+                <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener noreferrer" class="text-[11px] text-cyan-400 hover:underline">
                   Get Free Key from Google AI Studio ↗
                 </a>
               </div>
               <input 
                 type="password" 
                 id="gemini-key-input" 
+                maxlength="256"
                 class="w-full bg-slate-900 border border-slate-700/80 rounded-lg p-2.5 text-slate-200 text-xs font-mono focus:outline-none focus:border-slate-500"
-                placeholder="${hasGeminiKey ? (s.masked_key ? `Configured (${s.masked_key})` : 'Configured in browser') : 'AIzaSy... key for live Gemini 2.5 Flash'}"
+                placeholder="${hasGeminiKey ? (s.masked_key ? `Configured (${escapeHtml(s.masked_key)})` : 'Configured in browser') : 'AIzaSy... key for live Gemini 2.5 Flash'}"
               />
             </div>
 
@@ -3357,21 +3510,21 @@ async function renderSettings(container) {
                 <label class="flex items-start gap-2.5 p-2 rounded-lg border ${state.aiPersona === 'scientist' ? 'bg-slate-800/80 border-slate-600 text-white' : 'bg-slate-900/40 border-slate-800 text-slate-400'} cursor-pointer">
                   <input type="radio" name="ai-persona" value="scientist" ${state.aiPersona === 'scientist' ? 'checked' : ''} class="mt-0.5" onchange="window.switchAiPersona('scientist')">
                   <div>
-                    <div class="font-medium text-slate-200">Public Health & Atmospheric Scientist</div>
-                    <div class="text-[11px] text-slate-500">Inversion physics, boundary layer dynamics, WHO & CPCB benchmark analysis.</div>
+                    <div class="font-medium text-slate-200">Public Health &amp; Atmospheric Scientist</div>
+                    <div class="text-[11px] text-slate-500">Inversion physics, boundary layer dynamics, WHO &amp; CPCB benchmark analysis.</div>
                   </div>
                 </label>
                 <label class="flex items-start gap-2.5 p-2 rounded-lg border ${state.aiPersona === 'commuter' ? 'bg-slate-800/80 border-slate-600 text-white' : 'bg-slate-900/40 border-slate-800 text-slate-400'} cursor-pointer">
                   <input type="radio" name="ai-persona" value="commuter" ${state.aiPersona === 'commuter' ? 'checked' : ''} class="mt-0.5" onchange="window.switchAiPersona('commuter')">
                   <div>
-                    <div class="font-medium text-slate-200">Urban Commuter & Athlete Companion</div>
+                    <div class="font-medium text-slate-200">Urban Commuter &amp; Athlete Companion</div>
                     <div class="text-[11px] text-slate-500">Outdoor jogging safety, cycling routes, car HVAC cabin air recirculation tips.</div>
                   </div>
                 </label>
                 <label class="flex items-start gap-2.5 p-2 rounded-lg border ${state.aiPersona === 'pediatric' ? 'bg-slate-800/80 border-slate-600 text-white' : 'bg-slate-900/40 border-slate-800 text-slate-400'} cursor-pointer">
                   <input type="radio" name="ai-persona" value="pediatric" ${state.aiPersona === 'pediatric' ? 'checked' : ''} class="mt-0.5" onchange="window.switchAiPersona('pediatric')">
                   <div>
-                    <div class="font-medium text-slate-200">Pediatric & Senior Shielding Guardian</div>
+                    <div class="font-medium text-slate-200">Pediatric &amp; Senior Shielding Guardian</div>
                     <div class="text-[11px] text-slate-500">Asthma protocols, infant lung vulnerability, strict HEPA filtration guidelines.</div>
                   </div>
                 </label>
@@ -3396,24 +3549,22 @@ async function renderSettings(container) {
       <div class="glass-panel p-5 space-y-4">
         <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-300 flex items-center gap-2">
           ${icons.crosshair}
-          <span>Geolocation & Tracking</span>
+          <span>Geolocation &amp; Tracking</span>
         </h2>
 
-        <!-- Auto-Locate on Startup -->
         <div class="flex items-center justify-between p-3 rounded-lg border border-slate-800 bg-slate-900/40">
           <div>
             <div class="text-xs font-medium text-slate-200">Auto-Detect GPS on Launch</div>
             <div class="text-[11px] text-slate-500 mt-0.5">Automatically query high-accuracy GPS coordinates when page loads.</div>
           </div>
           <label class="switch shrink-0 ml-3">
-            <input type="checkbox" id="toggle-auto-locate" ${state.autoLocate ? 'checked' : ''}>
+            <input type="checkbox" id="toggle-auto-locate" aria-label="Auto-detect GPS on launch" ${state.autoLocate ? 'checked' : ''}>
             <span class="slider"></span>
           </label>
         </div>
 
-        <!-- Default Metro Fallback -->
         <div>
-          <label class="block text-xs text-slate-400 mb-1 font-medium">Default Monitoring Region</label>
+          <label for="select-default-city" class="block text-xs text-slate-400 mb-1 font-medium">Default Monitoring Region</label>
           <select id="select-default-city" class="w-full bg-slate-900 border border-slate-700/80 rounded-lg p-2 text-slate-200 text-xs focus:outline-none">
             <option value="Delhi NCR" ${state.currentCity.includes('Delhi') ? 'selected' : ''}>Delhi NCR (Anand Vihar Baseline)</option>
             <option value="Mumbai" ${state.currentCity.includes('Mumbai') ? 'selected' : ''}>Mumbai (Bandra / Colaba)</option>
@@ -3427,9 +3578,8 @@ async function renderSettings(container) {
           </select>
         </div>
 
-        <!-- Station Auto-Refresh Interval -->
         <div>
-          <label class="block text-xs text-slate-400 mb-1 font-medium">Sensor Data Refresh Cadence</label>
+          <label for="select-refresh-interval" class="block text-xs text-slate-400 mb-1 font-medium">Sensor Data Refresh Cadence</label>
           <select id="select-refresh-interval" class="w-full bg-slate-900 border border-slate-700/80 rounded-lg p-2 text-slate-200 text-xs focus:outline-none">
             <option value="1" ${state.refreshInterval === 1 ? 'selected' : ''}>Every 1 Minute (High Precision Polling)</option>
             <option value="5" ${state.refreshInterval === 5 ? 'selected' : ''}>Every 5 Minutes (Recommended Balance)</option>
@@ -3443,45 +3593,42 @@ async function renderSettings(container) {
       <div class="glass-panel p-5 space-y-4">
         <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-300 flex items-center gap-2">
           ${icons.sun}
-          <span>Display & Accessibility</span>
+          <span>Display &amp; Accessibility</span>
         </h2>
 
-        <!-- Appearance Theme -->
         <div>
           <label class="block text-xs text-slate-400 mb-2 font-medium">Theme Mode</label>
           <div class="grid grid-cols-2 gap-2 text-xs">
-            <button class="px-3.5 py-2 rounded-lg text-xs font-medium border flex items-center justify-center gap-2 transition ${state.theme === 'dark' ? 'bg-slate-800 text-white border-slate-500 shadow-sm' : 'bg-slate-900 text-slate-400 border-slate-800 hover:border-slate-700'}" onclick="window.switchTheme('dark')">
+            <button type="button" class="px-3.5 py-2 rounded-lg text-xs font-medium border flex items-center justify-center gap-2 transition ${state.theme === 'dark' ? 'bg-slate-800 text-white border-slate-500 shadow-sm' : 'bg-slate-900 text-slate-400 border-slate-800 hover:border-slate-700'}" onclick="window.switchTheme('dark')">
               ${icons.moon}
               <span>Dark Theme</span>
             </button>
-            <button class="px-3.5 py-2 rounded-lg text-xs font-medium border flex items-center justify-center gap-2 transition ${state.theme === 'light' ? 'bg-slate-800 text-white border-slate-500 shadow-sm' : 'bg-slate-900 text-slate-400 border-slate-800 hover:border-slate-700'}" onclick="window.switchTheme('light')">
+            <button type="button" class="px-3.5 py-2 rounded-lg text-xs font-medium border flex items-center justify-center gap-2 transition ${state.theme === 'light' ? 'bg-slate-800 text-white border-slate-500 shadow-sm' : 'bg-slate-900 text-slate-400 border-slate-800 hover:border-slate-700'}" onclick="window.switchTheme('light')">
               ${icons.sun}
               <span>Light Theme</span>
             </button>
           </div>
         </div>
 
-        <!-- Temperature Units -->
         <div>
           <label class="block text-xs text-slate-400 mb-2 font-medium">Temperature Metric</label>
           <div class="grid grid-cols-2 gap-2 text-xs">
-            <button class="px-3 py-2 rounded-lg text-xs font-medium border text-center transition ${state.tempUnit === 'C' ? 'bg-slate-800 text-white border-slate-500' : 'bg-slate-900 text-slate-400 border-slate-800 hover:border-slate-700'}" onclick="window.switchTempUnit('C')">
+            <button type="button" class="px-3 py-2 rounded-lg text-xs font-medium border text-center transition ${state.tempUnit === 'C' ? 'bg-slate-800 text-white border-slate-500' : 'bg-slate-900 text-slate-400 border-slate-800 hover:border-slate-700'}" onclick="window.switchTempUnit('C')">
               Celsius (°C)
             </button>
-            <button class="px-3 py-2 rounded-lg text-xs font-medium border text-center transition ${state.tempUnit === 'F' ? 'bg-slate-800 text-white border-slate-500' : 'bg-slate-900 text-slate-400 border-slate-800 hover:border-slate-700'}" onclick="window.switchTempUnit('F')">
+            <button type="button" class="px-3 py-2 rounded-lg text-xs font-medium border text-center transition ${state.tempUnit === 'F' ? 'bg-slate-800 text-white border-slate-500' : 'bg-slate-900 text-slate-400 border-slate-800 hover:border-slate-700'}" onclick="window.switchTempUnit('F')">
               Fahrenheit (°F)
             </button>
           </div>
         </div>
 
-        <!-- High-Contrast Accessibility Mode -->
         <div class="flex items-center justify-between p-3 rounded-lg border border-slate-800 bg-slate-900/40">
           <div>
             <div class="text-xs font-medium text-slate-200">High-Contrast Colorblind Mode</div>
             <div class="text-[11px] text-slate-500 mt-0.5">Enhance visual contrast and border indicators on AQI badges.</div>
           </div>
           <label class="switch shrink-0 ml-3">
-            <input type="checkbox" id="toggle-high-contrast" ${state.highContrast ? 'checked' : ''}>
+            <input type="checkbox" id="toggle-high-contrast" aria-label="High-contrast colorblind mode" ${state.highContrast ? 'checked' : ''}>
             <span class="slider"></span>
           </label>
         </div>
@@ -3492,7 +3639,7 @@ async function renderSettings(container) {
         <div>
           <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-300 flex items-center gap-2">
             ${icons.download}
-            <span>Data Management & Backup</span>
+            <span>Data Management &amp; Backup</span>
           </h2>
           <p class="text-xs text-slate-400 mt-1 max-w-xl leading-relaxed">
             All user profiles, sustainable action logs, and preferences are stored privately inside your browser. You can export your data as JSON or restore the clean baseline anytime.
@@ -3514,17 +3661,17 @@ async function renderSettings(container) {
     </div>
   `;
 
-  // Attach Google Maps form listeners
+  // Google Maps form listeners
   const gmapsForm = document.getElementById('gmaps-key-form');
   if (gmapsForm) {
     gmapsForm.addEventListener('submit', async (e) => {
       e.preventDefault();
       const val = document.getElementById('gmaps-key-input').value.trim();
-      const zoomVal = parseInt(document.getElementById('map-zoom-select').value);
+      const zoomVal = parseInt(document.getElementById('map-zoom-select').value, 10) || 11;
       state.googleMapsKey = val;
       state.mapZoomLevel = zoomVal;
       await api.saveSettings({ google_maps_api_key: val, map_zoom: zoomVal });
-      alert("Google Maps configuration saved successfully.");
+      showToast("Google Maps settings saved.", "success");
       renderSettings(container);
     });
   }
@@ -3555,13 +3702,13 @@ async function renderSettings(container) {
         resBox.classList.remove('hidden');
         if (result.status === 'success') {
           resBox.className = 'mt-3 p-3 rounded-lg text-xs bg-emerald-500/10 border-emerald-500/30 text-emerald-300';
-          resBox.innerHTML = `<strong>Verified:</strong> ${result.message}`;
+          resBox.innerHTML = `<strong>Verified:</strong> ${escapeHtml(result.message)}`;
         } else if (result.status === 'info') {
           resBox.className = 'mt-3 p-3 rounded-lg text-xs bg-blue-500/10 border-blue-500/30 text-blue-300';
-          resBox.innerHTML = `<strong>Note:</strong> ${result.message}`;
+          resBox.innerHTML = `<strong>Note:</strong> ${escapeHtml(result.message)}`;
         } else {
           resBox.className = 'mt-3 p-3 rounded-lg text-xs bg-rose-500/10 border-rose-500/30 text-rose-300';
-          resBox.innerHTML = `<strong>Warning:</strong> ${result.message}`;
+          resBox.innerHTML = `<strong>Warning:</strong> ${escapeHtml(result.message)}`;
         }
       }
     });
@@ -3574,7 +3721,7 @@ async function renderSettings(container) {
       e.preventDefault();
       const val = document.getElementById('gemini-key-input').value.trim();
       await api.saveSettings({ gemini_api_key: val });
-      alert("Gemini API Key saved.");
+      showToast("Gemini API configuration saved.", "success");
       renderSettings(container);
     });
   }
@@ -3585,7 +3732,7 @@ async function renderSettings(container) {
       const val = document.getElementById('gemini-key-input').value.trim();
       const resBox = document.getElementById('key-test-result');
       if (!val) {
-        alert("Please enter a key to test.");
+        showToast("Please enter a Gemini API key to test.", "warning");
         return;
       }
       testBtn.innerHTML = 'Testing...';
@@ -3595,29 +3742,30 @@ async function renderSettings(container) {
         resBox.classList.remove('hidden');
         if (result.status === 'success') {
           resBox.className = 'mt-3 p-3 rounded-lg text-xs bg-emerald-500/10 border-emerald-500/30 text-emerald-300';
-          resBox.innerHTML = `Verified: ${result.message} <br><em>Model: ${result.model}</em>`;
+          resBox.innerHTML = `Verified: ${escapeHtml(result.message)} <br><em>Model: ${escapeHtml(result.model)}</em>`;
         } else {
           resBox.className = 'mt-3 p-3 rounded-lg text-xs bg-rose-500/10 border-rose-500/30 text-rose-300';
-          resBox.innerHTML = `Error: ${result.message}`;
+          resBox.innerHTML = `Error: ${escapeHtml(result.message)}`;
         }
       }
     });
   }
 
-  // Toggles and Selectors
   const autoLocateToggle = document.getElementById('toggle-auto-locate');
   if (autoLocateToggle) {
     autoLocateToggle.addEventListener('change', async (e) => {
       state.autoLocate = e.target.checked;
       await api.saveSettings({ auto_locate: state.autoLocate });
+      showToast(`Auto-locate on launch ${state.autoLocate ? 'enabled' : 'disabled'}.`, "info");
     });
   }
 
   const highContrastToggle = document.getElementById('toggle-high-contrast');
   if (highContrastToggle) {
     highContrastToggle.addEventListener('change', async (e) => {
-      state.highContrast = e.target.checked;
+      applyHighContrast(e.target.checked);
       await api.saveSettings({ high_contrast: state.highContrast });
+      showToast(`High-contrast mode ${state.highContrast ? 'enabled' : 'disabled'}.`, "info");
       renderCurrentView();
     });
   }
@@ -3625,8 +3773,11 @@ async function renderSettings(container) {
   const citySelect = document.getElementById('select-default-city');
   if (citySelect) {
     citySelect.addEventListener('change', async (e) => {
+      state.userCoords = null;
+      state.nearestStation = null;
       state.currentCity = e.target.value;
       await loadInitialData();
+      showToast(`Default monitoring region changed to ${state.currentCity}.`, "success");
       renderSettings(container);
     });
   }
@@ -3634,8 +3785,10 @@ async function renderSettings(container) {
   const refreshSelect = document.getElementById('select-refresh-interval');
   if (refreshSelect) {
     refreshSelect.addEventListener('change', async (e) => {
-      state.refreshInterval = parseInt(e.target.value);
+      state.refreshInterval = parseInt(e.target.value, 10) || 0;
       await api.saveSettings({ refresh_interval: state.refreshInterval });
+      syncRefreshTimer();
+      showToast(state.refreshInterval > 0 ? `Auto-refresh set to every ${state.refreshInterval} min.` : "Auto-refresh set to manual.", "info");
     });
   }
 }
@@ -3647,26 +3800,26 @@ window.switchTheme = function (theme) {
 
 window.switchTempUnit = function (unit) {
   state.tempUnit = unit;
-  localStorage.setItem('vayusaathi_temp_unit', unit);
-  localStorage.setItem('hawawise_temp_unit', unit);
+  try { localStorage.setItem('vayusaathi_temp_unit', unit); } catch (e) {}
   renderCurrentView();
 };
 
 window.switchMapLayer = function (layer) {
   state.mapLayer = layer;
-  localStorage.setItem('vayusaathi_map_layer', layer);
-  localStorage.setItem('hawawise_map_layer', layer);
+  try { localStorage.setItem('vayusaathi_map_layer', layer); } catch (e) {}
   if (window.leafletMapInstance) {
     updateMapTileLayer(window.leafletMapInstance, layer);
   }
   const sel = document.getElementById('map-layer-selector');
   if (sel) sel.value = layer;
+  showToast(`Default map style set to ${layer.replace('google_', 'Google ').replace('_', ' ')}.`, "info");
   renderCurrentView();
 };
 
 window.switchAiPersona = function (persona) {
   state.aiPersona = persona;
-  localStorage.setItem('vayusaathi_ai_persona', persona);
+  try { localStorage.setItem('vayusaathi_ai_persona', persona); } catch (e) {}
+  showToast(`Assistant persona updated to ${persona}.`, "info");
   renderCurrentView();
 };
 
@@ -3693,18 +3846,26 @@ window.toggleMapFullscreen = function () {
 };
 
 window.exportActivityLog = function () {
-  const actions = localStorage.getItem('vayusaathi_logged_actions') || localStorage.getItem('hawawise_logged_actions') || '[]';
-  const profile = localStorage.getItem('vayusaathi_profile') || localStorage.getItem('hawawise_profile') || '{}';
+  let profileObj = {};
+  let actionsArr = [];
+  try {
+    profileObj = JSON.parse(localStorage.getItem('vayusaathi_profile') || localStorage.getItem('hawawise_profile') || '{}');
+  } catch (e) {}
+  try {
+    actionsArr = JSON.parse(localStorage.getItem('vayusaathi_logged_actions') || localStorage.getItem('hawawise_logged_actions') || '[]');
+  } catch (e) {}
+
   const data = {
     app: "VayuSaathi",
     version: "2.0.0",
     exportedAt: new Date().toISOString(),
-    profile: JSON.parse(profile),
-    loggedActions: JSON.parse(actions),
+    profile: profileObj,
+    loggedActions: actionsArr,
     activeSettings: {
       mapLayer: state.mapLayer,
       tempUnit: state.tempUnit,
-      aiPersona: state.aiPersona
+      aiPersona: state.aiPersona,
+      highContrast: state.highContrast
     }
   };
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
@@ -3714,6 +3875,7 @@ window.exportActivityLog = function () {
   a.download = `VayuSaathi_Activity_Log_${new Date().toISOString().slice(0, 10)}.json`;
   a.click();
   URL.revokeObjectURL(url);
+  showToast("Activity log JSON exported.", "success");
 };
 
 window.resetToBaselineData = function () {
@@ -3724,18 +3886,39 @@ window.resetToBaselineData = function () {
       'vayusaathi_map_zoom', 'vayusaathi_high_contrast', 'vayusaathi_refresh_interval',
       'vayusaathi_ai_persona', 'vayusaathi_logged_actions', 'vayusaathi_community_reports',
       'vayusaathi_profile', 'vayusaathi_chat_history', 'vayusaathi_read_alerts',
-      'hawawise_theme', 'hawawise_temp_unit', 'hawawise_map_layer'
+      'vayusaathi_custom_alerts', 'vayusaathi_saved_routines',
+      'hawawise_theme', 'hawawise_temp_unit', 'hawawise_map_layer',
+      'hawawise_logged_actions', 'hawawise_community_reports', 'hawawise_profile',
+      'hawawise_chat_history', 'hawawise_read_alerts'
     ];
-    keysToRemove.forEach(k => localStorage.removeItem(k));
-    alert("Baseline settings successfully restored.");
-    window.location.reload();
+    keysToRemove.forEach(k => {
+      try { localStorage.removeItem(k); } catch (e) {}
+    });
+    showToast("Baseline dataset restored. Reloading...", "success");
+    setTimeout(() => window.location.reload(), 400);
   }
 };
 
-// Escape key listener to exit map fullscreen
+// Global Escape handler (closes modals, mobile sidebar, and map fullscreen cleanly)
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && state.isMapFullscreen) {
+  if (e.key !== 'Escape') return;
+  if (state.isMapFullscreen) {
     window.toggleMapFullscreen();
+    return;
+  }
+  const actionModal = document.getElementById('action-modal');
+  if (actionModal && !actionModal.classList.contains('hidden')) {
+    actionModal.classList.add('hidden');
+    return;
+  }
+  const reportModal = document.getElementById('report-modal');
+  if (reportModal && !reportModal.classList.contains('hidden')) {
+    reportModal.classList.add('hidden');
+    return;
+  }
+  const sidebar = document.getElementById('sidebar');
+  if (sidebar && window.innerWidth < 768 && !sidebar.classList.contains('hidden')) {
+    sidebar.classList.add('hidden');
   }
 });
 
@@ -3754,7 +3937,7 @@ function renderJudgesDemo(container) {
         </p>
       </div>
 
-      <button onclick="window.hawawiseNavigate('dashboard')" class="text-xs bg-slate-900 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-700/80 px-3.5 py-2 rounded-lg transition">
+      <button type="button" onclick="window.vayusaathiNavigate('dashboard')" class="text-xs bg-slate-900 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-700/80 px-3.5 py-2 rounded-lg transition">
         ← Return to Overview
       </button>
     </div>
@@ -3769,55 +3952,52 @@ function renderJudgesDemo(container) {
       </p>
 
       <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
-        <!-- Delhi -->
-        <div class="p-4 rounded-lg bg-slate-900/50 border border-slate-800 hover:border-slate-700 transition cursor-pointer flex flex-col justify-between" onclick="window.loadJudgeScenario('delhi_winter')">
+        <div role="button" tabindex="0" class="p-4 rounded-lg bg-slate-900/50 border border-slate-800 hover:border-slate-700 transition cursor-pointer flex flex-col justify-between" onclick="window.loadJudgeScenario('delhi_winter')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();window.loadJudgeScenario('delhi_winter');}">
           <div>
             <div class="flex items-center justify-between">
               <span class="text-xs font-semibold text-white">Scenario A: Delhi NCR</span>
-              <span class="text-[10px] font-semibold px-2 py-0.5 rounded border border-rose-500/30 text-rose-400">AQI 386</span>
+              <span data-aqi-badge class="text-[10px] font-semibold px-2 py-0.5 rounded border border-rose-500/30 text-rose-400">AQI 386</span>
             </div>
             <div class="text-xs font-medium text-rose-300 mt-1">Severe Winter Inversion</div>
             <p class="text-xs text-slate-400 mt-2 leading-relaxed">
               Household of 4 with 1 asthmatic child and 1 senior. Open two-wheeler commuter facing acute early morning smog peaks.
             </p>
           </div>
-          <button class="mt-4 w-full bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium py-1.5 rounded-lg transition">
+          <span class="mt-4 w-full text-center bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium py-1.5 rounded-lg transition">
             Load Scenario →
-          </button>
+          </span>
         </div>
 
-        <!-- Bengaluru -->
-        <div class="p-4 rounded-lg bg-slate-900/50 border border-slate-800 hover:border-slate-700 transition cursor-pointer flex flex-col justify-between" onclick="window.loadJudgeScenario('bengaluru_clean')">
+        <div role="button" tabindex="0" class="p-4 rounded-lg bg-slate-900/50 border border-slate-800 hover:border-slate-700 transition cursor-pointer flex flex-col justify-between" onclick="window.loadJudgeScenario('bengaluru_clean')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();window.loadJudgeScenario('bengaluru_clean');}">
           <div>
             <div class="flex items-center justify-between">
               <span class="text-xs font-semibold text-white">Scenario B: Bengaluru</span>
-              <span class="text-[10px] font-semibold px-2 py-0.5 rounded border border-emerald-500/30 text-emerald-400">AQI 88</span>
+              <span data-aqi-badge class="text-[10px] font-semibold px-2 py-0.5 rounded border border-emerald-500/30 text-emerald-400">AQI 88</span>
             </div>
             <div class="text-xs font-medium text-emerald-300 mt-1">Plateau Transit Study</div>
             <p class="text-xs text-slate-400 mt-2 leading-relaxed">
               Satisfactory ambient air with localized traffic congestion. Household adopting metro rail transit and emission tracking.
             </p>
           </div>
-          <button class="mt-4 w-full bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium py-1.5 rounded-lg transition">
+          <span class="mt-4 w-full text-center bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium py-1.5 rounded-lg transition">
             Load Scenario →
-          </button>
+          </span>
         </div>
 
-        <!-- Lahore -->
-        <div class="p-4 rounded-lg bg-slate-900/50 border border-slate-800 hover:border-slate-700 transition cursor-pointer flex flex-col justify-between" onclick="window.loadJudgeScenario('lahore_smog')">
+        <div role="button" tabindex="0" class="p-4 rounded-lg bg-slate-900/50 border border-slate-800 hover:border-slate-700 transition cursor-pointer flex flex-col justify-between" onclick="window.loadJudgeScenario('lahore_smog')" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();window.loadJudgeScenario('lahore_smog');}">
           <div>
             <div class="flex items-center justify-between">
               <span class="text-xs font-semibold text-white">Scenario C: Lahore Basin</span>
-              <span class="text-[10px] font-semibold px-2 py-0.5 rounded border border-purple-500/30 text-purple-400">AQI 468</span>
+              <span data-aqi-badge class="text-[10px] font-semibold px-2 py-0.5 rounded border border-purple-500/30 text-purple-400">AQI 468</span>
             </div>
             <div class="text-xs font-medium text-purple-300 mt-1">Hazardous Smog Emergency</div>
             <p class="text-xs text-slate-400 mt-2 leading-relaxed">
               Transboundary agricultural smoke and thermal stagnation. Safe-haven bedroom protocol and school outdoor closures activated.
             </p>
           </div>
-          <button class="mt-4 w-full bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium py-1.5 rounded-lg transition">
+          <span class="mt-4 w-full text-center bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-medium py-1.5 rounded-lg transition">
             Load Scenario →
-          </button>
+          </span>
         </div>
       </div>
     </div>
@@ -3826,9 +4006,9 @@ function renderJudgesDemo(container) {
     <div class="glass-panel p-5 mb-6">
       <div class="flex items-center justify-between mb-4">
         <h2 class="text-xs font-semibold uppercase tracking-wider text-slate-300">
-          Sensor & Location Diagnostics
+          Sensor &amp; Location Diagnostics
         </h2>
-        <button onclick="window.detectLocationFromDemo()" class="btn-gps-trigger bg-slate-900 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-700 text-xs px-2.5 py-1.5 rounded-lg transition font-medium flex items-center gap-1.5">
+        <button type="button" onclick="window.detectLocationFromDemo()" class="btn-gps-trigger bg-slate-900 hover:bg-slate-800 text-slate-300 hover:text-white border border-slate-700 text-xs px-2.5 py-1.5 rounded-lg transition font-medium flex items-center gap-1.5">
           ${icons.crosshair}
           <span>Run GPS Test</span>
         </button>
@@ -3852,7 +4032,7 @@ function renderJudgesDemo(container) {
         <div class="p-3.5 rounded-lg bg-slate-900/50 border border-slate-800">
           <div class="text-slate-500">Dominant Sub-Index</div>
           <div class="text-xs font-medium text-rose-400 mt-1">
-            ${state.airQuality?.dominant_pollutant || 'PM2.5'} (${state.airQuality?.pollutants?.pm2_5?.sub_index || 386})
+            ${escapeHtml(state.airQuality?.dominant_pollutant || 'PM2.5')} (${escapeHtml(state.airQuality?.pollutants?.pm2_5?.sub_index || 386)})
           </div>
           <div class="text-[10px] text-slate-500 mt-1">Maximum across 7 measured parameters</div>
         </div>
@@ -3862,7 +4042,7 @@ function renderJudgesDemo(container) {
           <div class="text-xs font-medium ${state.airQuality?.weather?.temperature_inversion_detected ? 'text-rose-400' : 'text-emerald-400'} mt-1">
             ${state.airQuality?.weather?.temperature_inversion_detected ? 'Boundary Trapping Active' : 'Normal Dispersion'}
           </div>
-          <div class="text-[10px] text-slate-500 mt-1">Calibrated on wind speed & ambient temp</div>
+          <div class="text-[10px] text-slate-500 mt-1">Calibrated on wind speed &amp; ambient temp</div>
         </div>
       </div>
     </div>
@@ -3902,16 +4082,16 @@ function renderJudgesDemo(container) {
         System Capabilities
       </h2>
       <div class="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs text-slate-400">
-        <div class="flex items-center gap-2"><span class="text-emerald-500">${icons.check}</span> Conversational air assistant via Google Gemini SDK</div>
-        <div class="flex items-center gap-2"><span class="text-emerald-500">${icons.check}</span> Live Open-Meteo & Indian CPCB NAQI calculation</div>
-        <div class="flex items-center gap-2"><span class="text-emerald-500">${icons.check}</span> Real-time browser GPS location detection & tracking</div>
-        <div class="flex items-center gap-2"><span class="text-emerald-500">${icons.check}</span> Spatial monitoring network with 30+ regional stations</div>
-        <div class="flex items-center gap-2"><span class="text-emerald-500">${icons.check}</span> Multi-layer Leaflet map (Dark, Light, Street)</div>
+        <div class="flex items-center gap-2"><span class="text-emerald-500">${icons.check}</span> Conversational air assistant via Google Gemini &amp; CPCB engine</div>
+        <div class="flex items-center gap-2"><span class="text-emerald-500">${icons.check}</span> Live Open-Meteo &amp; Indian CPCB NAQI calculation</div>
+        <div class="flex items-center gap-2"><span class="text-emerald-500">${icons.check}</span> Real-time browser GPS location detection &amp; live tracking</div>
+        <div class="flex items-center gap-2"><span class="text-emerald-500">${icons.check}</span> Spatial monitoring network with 30+ national stations</div>
+        <div class="flex items-center gap-2"><span class="text-emerald-500">${icons.check}</span> Multi-layer Google Maps Engine (Roadmap, Satellite, Hybrid, Terrain, Traffic)</div>
         <div class="flex items-center gap-2"><span class="text-emerald-500">${icons.check}</span> Automatic nearest-station Haversine proximity engine</div>
         <div class="flex items-center gap-2"><span class="text-emerald-500">${icons.check}</span> Click-anywhere map coordinate inspection</div>
         <div class="flex items-center gap-2"><span class="text-emerald-500">${icons.check}</span> Household protection protocols for vulnerable groups</div>
-        <div class="flex items-center gap-2"><span class="text-emerald-500">${icons.check}</span> Diurnal smog schedule generator</div>
-        <div class="flex items-center gap-2"><span class="text-emerald-500">${icons.check}</span> Environmental impact and carbon tracker</div>
+        <div class="flex items-center gap-2"><span class="text-emerald-500">${icons.check}</span> Diurnal smog schedule generator &amp; CADR purifier sizing</div>
+        <div class="flex items-center gap-2"><span class="text-emerald-500">${icons.check}</span> Environmental impact and carbon tracker with JSON export</div>
       </div>
     </div>
   `;
@@ -3923,13 +4103,14 @@ window.detectLocationFromDemo = function () {
 
 window.loadJudgeScenario = async function (scenarioKey) {
   state.userCoords = null;
+  state.nearestStation = null;
   const sc = await api.getDemoScenario(scenarioKey);
   state.currentCity = sc.city;
   state.airQuality = await api.getAirQuality(sc.city);
   state.profile = sc.household;
   await api.saveProfile(sc.household);
   updateTopHeaderMetrics();
-  alert(`Scenario '${sc.title}' loaded.`);
+  showToast(`Loaded scenario: ${sc.title || sc.city}.`, "success");
   navigateTo('dashboard');
 };
 
@@ -3952,9 +4133,10 @@ function setupGlobalModals() {
     actionForm.addEventListener('submit', async (e) => {
       e.preventDefault();
       const actType = document.getElementById('m-act-type').value;
-      const actTitle = document.getElementById('m-act-title').value;
-      const actCo2 = parseFloat(document.getElementById('m-act-co2').value) || 1.2;
-      const actPm = parseFloat(document.getElementById('m-act-pm').value) || 0.4;
+      const actTitle = document.getElementById('m-act-title').value.trim();
+      if (!actTitle) return;
+      const actCo2 = Math.max(0, parseFloat(document.getElementById('m-act-co2').value) || 1.2);
+      const actPm = Math.max(0, parseFloat(document.getElementById('m-act-pm').value) || 0.4);
 
       await api.logImpactAction({
         action_type: actType,
@@ -3965,8 +4147,9 @@ function setupGlobalModals() {
         points: 25
       });
 
+      actionForm.reset();
       actionModal.classList.add('hidden');
-      alert("Action logged.");
+      showToast("Clean-air action logged (+25 pts).", "success");
       renderCurrentView();
     });
   }
@@ -3982,11 +4165,12 @@ function setupGlobalModals() {
   if (reportForm && reportModal) {
     reportForm.addEventListener('submit', async (e) => {
       e.preventDefault();
-      const title = document.getElementById('rep-title').value;
+      const title = document.getElementById('rep-title').value.trim();
       const category = document.getElementById('rep-cat').value;
-      const loc = document.getElementById('rep-loc').value;
+      const loc = document.getElementById('rep-loc').value.trim();
       const sev = document.getElementById('rep-sev').value;
-      const desc = document.getElementById('rep-desc').value;
+      const desc = document.getElementById('rep-desc').value.trim();
+      if (!title || !loc || !desc) return;
 
       await api.submitCommunityReport({
         title,
@@ -3996,8 +4180,9 @@ function setupGlobalModals() {
         description: desc
       });
 
+      reportForm.reset();
       reportModal.classList.add('hidden');
-      alert("Report submitted.");
+      showToast("Incident report submitted safely.", "success");
       renderCurrentView();
     });
   }
