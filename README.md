@@ -160,21 +160,6 @@ Visit: **[http://localhost:8000](http://localhost:8000)**
 
 ---
 
-## 🎬 Mandatory Video Demonstration
-
-A complete, high-definition 1080p MP4 demonstration video has been successfully generated and verified in the repository:
-- **Location:** `video-submission/HawaWise_AI_Demo.mp4`
-- **Duration:** 2 minutes 11 seconds (131.4 seconds)
-- **Resolution:** 1920x1080 Full HD (16:9 Landscape)
-- **Audio:** Spoken voiceover narration mixed with an ambient synthesizer score
-- **In-App Streaming:** Click **"Judges' Demo Mode"** in the top navigation bar to watch or download the video directly inside the web application!
-
-To re-render the video from source:
-```bash
-python video-submission/generate_video.py
-```
-
----
 
 ## 🧪 Testing & Verification Report
 
