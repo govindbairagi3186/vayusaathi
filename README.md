@@ -2,6 +2,8 @@
 
 **GenAI-powered and CPCB-calibrated winter smog & urban air pollution assistant for families, commuters, and communities.**
 
+**Live Website:** [https://govindbairagi3186.github.io/vayusaathi/](https://govindbairagi3186.github.io/vayusaathi/)
+
 ---
 
 ## Key Capabilities

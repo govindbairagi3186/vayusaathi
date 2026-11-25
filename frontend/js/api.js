@@ -61,7 +61,7 @@
     }
   }
 
-  // Check backend connectivity once silently (prevents ERR_CONNECTION_REFUSED console floods)
+  // Check backend connectivity once silently (prevents 404/Mixed Content noise on static hosts)
   async function checkBackendOnce() {
     if (backendChecked) return isBackendOnline;
     backendChecked = true;
@@ -72,7 +72,14 @@
     }
 
     const loc = window.location;
-    if (loc.port === "8000") {
+    const host = (loc.hostname || "").toLowerCase();
+    if (host.endsWith(".github.io")) {
+      isBackendOnline = false;
+      return false;
+    }
+
+    const isLocalHost = host === "localhost" || host === "127.0.0.1" || host === "[::1]";
+    if (loc.port === "8000" && isLocalHost) {
       activeApiBase = loc.origin;
       isBackendOnline = true;
       return true;
@@ -80,7 +87,7 @@
 
     const probes = [];
     if (loc.protocol.startsWith("http")) probes.push(loc.origin);
-    probes.push("http://127.0.0.1:8000");
+    if (isLocalHost && loc.protocol === "http:") probes.push("http://127.0.0.1:8000");
 
     for (const base of probes) {
       try {
